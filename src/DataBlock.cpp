@@ -1,6 +1,17 @@
-#include "sb-tree.h"
+#include "DataBlock.h"
 
-// ===== DataBlock 接口实现 =====
+DataBlock::DataBlock()
+    : status_(Status::READY),
+      min_key_(std::numeric_limits<Key>::max()),
+      next_(nullptr),
+      lock_(0),
+      count_(0)
+{
+    for (size_t i = 0; i < kBuckets; ++i)
+    {
+        nary_[i] = std::numeric_limits<Key>::max();
+    }
+}
 
 size_t DataBlock::build_from_sorted(const KVPair *src, size_t n)
 {
@@ -14,7 +25,9 @@ size_t DataBlock::build_from_sorted(const KVPair *src, size_t n)
 
     count_ = static_cast<uint32_t>(take);
     if (take > 0)
+    {
         min_key_ = keys_[0];
+    }
 
     build_nary_();
     return take; // 注意：如果 n > kCapacity，调用方需要继续分配下一个 DataBlock
@@ -59,8 +72,6 @@ size_t DataBlock::scan_from(Key startKey, size_t count, std::vector<Value> &out)
     return taken;
 }
 
-// ===================== 辅助函数 =====================
-
 void DataBlock::build_nary_()
 {
     if (count_ == 0)
@@ -79,7 +90,9 @@ void DataBlock::build_nary_()
     }
 
     for (size_t i = buckets; i < kBuckets; ++i)
+    {
         nary_[i] = std::numeric_limits<Key>::max();
+    }
 }
 
 std::pair<size_t, size_t> DataBlock::bucket_range_(Key k) const

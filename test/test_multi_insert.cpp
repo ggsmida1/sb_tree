@@ -3,7 +3,7 @@
 #include <iostream>
 #include <thread>
 #include <vector>
-#include "sb-tree.h"
+#include "SBTree.h"
 
 int main()
 {

@@ -1,4 +1,4 @@
-#include "sb-tree.h"
+#include "SBTree.h"
 #include <iostream>
 #include <vector>
 #include <cassert>
