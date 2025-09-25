@@ -34,6 +34,13 @@ public:
     DataBlock *next() const { return next_; }
     void set_next(DataBlock *p) { next_ = p; }
 
+    // ++ 新增：用于测试的访问器 ++
+    // 获取指定索引的键值对（不进行边界检查，调用方保证索引有效）
+    KVPair get_entry(size_t index) const
+    {
+        return {keys_[index], vals_[index]};
+    }
+
 private:
     // === 固定大小常量 ===
     static constexpr size_t kBlockSize = 4096; // 整块大小 4KB
