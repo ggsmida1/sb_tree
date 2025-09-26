@@ -31,48 +31,73 @@ void SBTree::convert_and_append(SegmentedBlock *seg_to_convert)
     if (!seg_to_convert)
         return;
 
+    // 1) 收集并排序（单线程阶段在这里释放旧段是安全的）
     std::vector<KVPair> sorted_data = seg_to_convert->collect_and_sort_data();
-    delete seg_to_convert; // 在这里释放旧块
+    delete seg_to_convert;
 
-    if (!sorted_data.empty())
+    if (sorted_data.empty())
+        return;
+
+    // 2) 构建“本次 run”的 DataBlock 链，并记录这批块用于索引追加
+    DataBlock *new_chain_head = nullptr;
+    DataBlock *new_chain_tail = nullptr;
+    std::vector<DataBlock *> new_blocks; // ← 关键：收集本次 run 的块
+    new_blocks.reserve(16);              // 可选：粗略预留，避免多次扩容
+
+    const KVPair *current_pos = sorted_data.data();
+    size_t remaining = sorted_data.size();
+
+    bool first_block = true;
+    Key prev_min = 0;
+
+    while (remaining > 0)
     {
-        // ... (分块并追加到主链表的逻辑，和之前一样) ...
-        DataBlock *new_chain_head = nullptr;
-        DataBlock *new_chain_tail = nullptr;
-        const KVPair *current_pos = sorted_data.data();
-        size_t remaining = sorted_data.size();
-        while (remaining > 0)
+        DataBlock *new_block = new DataBlock();
+        size_t consumed = new_block->build_from_sorted(current_pos, remaining);
+        assert(consumed > 0 && "build_from_sorted must consume > 0");
+
+        // 串成临时链
+        if (!new_chain_head)
         {
-            DataBlock *new_block = new DataBlock();
-            size_t consumed = new_block->build_from_sorted(current_pos, remaining);
-            if (!new_chain_head)
-            {
-                new_chain_head = new_chain_tail = new_block;
-            }
-            else
-            {
-                new_chain_tail->set_next(new_block);
-                new_chain_tail = new_block;
-            }
-            current_pos += consumed;
-            remaining -= consumed;
+            new_chain_head = new_chain_tail = new_block;
+        }
+        else
+        {
+            new_chain_tail->set_next(new_block);
+            new_chain_tail = new_block;
         }
 
+        // 记录到本次 run 列表（要求按 min_key 非降）
+        if (!first_block)
         {
-            std::lock_guard<std::mutex> g(data_layer_lock_);
-            if (!data_tail_)
-            {
-                data_head_ = new_chain_head;
-                data_tail_ = new_chain_tail;
-            }
-            else
-            {
-                data_tail_->set_next(new_chain_head);
-                data_tail_ = new_chain_tail;
-            }
+            assert(prev_min <= new_block->min_key() && "blocks' min_key must be non-decreasing");
         }
-        std::cout << "Appended " << sorted_data.size() << " entries to the data layer.\n";
+        prev_min = new_block->min_key();
+        first_block = false;
+        new_blocks.push_back(new_block);
+
+        current_pos += consumed;
+        remaining -= consumed;
     }
+
+    // 3) 追加到数据层（小临界区）
+    {
+        std::lock_guard<std::mutex> g(data_layer_lock_);
+        if (!data_tail_)
+        {
+            data_head_ = new_chain_head;
+            data_tail_ = new_chain_tail;
+        }
+        else
+        {
+            data_tail_->set_next(new_chain_head);
+            data_tail_ = new_chain_tail;
+        }
+    }
+    std::cout << "Appended " << sorted_data.size() << " entries to the data layer.\n";
+
+    // 4) 搜索层：数据层尾插成功之后，再批量追加索引（保持“不领先”语义）
+    search_.append_run(new_blocks);
 }
 
 // ++ 新增：实现 flush 方法 ++
@@ -134,6 +159,36 @@ void SBTree::insert(Key key, Value value)
             delete new_seg;
         }
     }
+}
+
+bool SBTree::lookup(Key k, Value *out) const
+{
+    // 单线程阶段：读也加锁；以后可改为读优化
+    std::lock_guard<std::mutex> g(data_layer_lock_);
+
+    // 1) 先用搜索层定位候选块；若索引为空/滞后，则退回链表头
+    DataBlock *blk = search_.find_candidate(k);
+    if (!blk)
+        blk = data_head_;
+
+    // 2) 沿链表向右兜底（只靠 min_key 即可判断是否需要右移）
+    while (blk)
+    {
+        Value v{};
+        if (blk->find(k, v))
+
+        { // 命中
+            if (out)
+                *out = v;
+            return true;
+        }
+        DataBlock *nxt = blk->next();
+        // 如果没有下一块，或下一块的 min_key 已经大于 k，说明后面不可能有 k
+        if (!nxt || nxt->min_key() > k)
+            break;
+        blk = nxt; // 继续向右兜底
+    }
+    return false; // 未命中
 }
 
 bool SBTree::verify_data_layer(size_t expected_total_keys) const

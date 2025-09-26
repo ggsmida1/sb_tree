@@ -5,6 +5,7 @@
 #include "SegmentedBlock.h"
 #include "DataBlock.h"
 #include "PerThreadDataBlock.h"
+#include "SearchLayer.h"
 
 // SBTree 主类
 class SBTree
@@ -15,6 +16,9 @@ public:
 
     // 顺序插入（key 单增假设）
     void insert(Key key, Value value);
+
+    // 查找
+    bool lookup(Key k, Value *out) const;
 
     // ++ 新增：用于测试的验证方法 ++
     // 遍历整个数据层，验证总数、顺序和数据正确性
@@ -33,4 +37,7 @@ private:
     mutable std::mutex data_layer_lock_; // ++ 改为 mutable ++
     DataBlock *data_head_;               // 数据块链表的头指针
     DataBlock *data_tail_;               // 数据块链表的尾指针
+
+    // 搜索层
+    SearchLayer search_;
 };
