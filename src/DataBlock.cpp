@@ -72,6 +72,45 @@ size_t DataBlock::scan_from(Key startKey, size_t count, std::vector<Value> &out)
     return taken;
 }
 
+size_t DataBlock::scan_range(Key start, Key end, std::vector<Value> &out) const
+{
+    if (start > end)
+        return 0;
+
+    // 二分找块内第一个 key >= start 的位置
+    size_t n = this->size();
+    size_t L = 0, R = n;
+    size_t pos = n; // 默认找不到则为 n
+    while (L < R)
+    {
+        size_t mid = L + ((R - L) >> 1);
+        const KVPair &e = this->get_entry(mid);
+        if (e.key >= start)
+        {
+            pos = mid;
+            R = mid;
+        }
+        else
+        {
+            L = mid + 1;
+        }
+    }
+    if (pos == n)
+        return 0; // 块内全都 < start
+
+    // 从 pos 开始线性追加，直到 key > end 或用尽
+    size_t taken = 0;
+    for (size_t i = pos; i < n; ++i)
+    {
+        const KVPair &e = this->get_entry(i);
+        if (e.key > end)
+            break;
+        out.push_back(e.value);
+        ++taken;
+    }
+    return taken;
+}
+
 void DataBlock::build_nary_()
 {
     if (count_ == 0)

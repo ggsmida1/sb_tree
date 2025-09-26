@@ -191,6 +191,78 @@ bool SBTree::lookup(Key k, Value *out) const
     return false; // 未命中
 }
 
+size_t SBTree::scan_from(Key start, size_t count, std::vector<Value> &out) const
+{
+    if (count == 0)
+        return 0;
+
+    std::lock_guard<std::mutex> g(data_layer_lock_);
+
+    // 1) 索引定位起点块；若索引为空/滞后，则退回链表头
+    DataBlock *blk = search_.find_candidate(start); // 候选块（最后一个 min_key <= start）
+    if (!blk)
+        blk = data_head_; // 兜底：从链表头开始
+
+    size_t remaining = count;
+    Key cur = start;
+    size_t taken_total = 0;
+
+    while (blk && remaining > 0)
+    {
+        // 2) 在当前块从 cur 开始扫描，最多 remaining 个
+        size_t got = blk->scan_from(cur, remaining, out); // 单块扫描（最多 remaining）
+        taken_total += got;
+        remaining -= got;
+
+        if (remaining == 0)
+            break;
+
+        // 3) 右移到下一块，更新下一块的起始 key
+        DataBlock *nxt = blk->next();
+        if (!nxt)
+            break;
+        // 保持 cur 不变（全局起点）；可选：cur = std::max(cur, nxt->min_key());
+        blk = nxt;
+    }
+
+    return taken_total;
+}
+
+size_t SBTree::scan_range(Key l, Key r, std::vector<Value> &out) const
+{
+    if (l > r)
+        return 0;
+
+    std::lock_guard<std::mutex> g(data_layer_lock_);
+
+    // 1) 用索引定位起点块（最后一个 min_key <= l），否则从链表头开始
+    DataBlock *blk = search_.find_candidate(l);
+    if (!blk)
+        blk = data_head_;
+
+    size_t taken_total = 0;
+
+    // 2) 跨块扫描，直到越过 r 或链表结束
+    while (blk)
+    {
+        // 当前块最小键若已 > r，后面更不可能有
+        if (blk->min_key() > r)
+            break;
+
+        taken_total += blk->scan_range(l, r, out);
+
+        // 右移
+        blk = blk->next();
+        if (!blk)
+            break;
+
+        // 保持 l 不变即可；块内 scan_range 会再做二分裁剪
+        // l = std::max(l, blk->min_key());  // 可选，等价
+    }
+
+    return taken_total;
+}
+
 bool SBTree::verify_data_layer(size_t expected_total_keys) const
 {
     std::lock_guard<std::mutex> g(data_layer_lock_);

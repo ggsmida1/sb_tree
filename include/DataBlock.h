@@ -28,6 +28,9 @@ public:
     // 扫描：从 startKey 起，最多取 count 个，写入 out；返回实际条数
     size_t scan_from(Key startKey, size_t count, std::vector<Value> &out) const;
 
+    // 在当前块内扫描 [start, end]，把命中的 value 追加到 out，返回追加的条数
+    size_t scan_range(Key start, Key end, std::vector<Value> &out) const;
+
     // 访问器
     size_t size() const { return count_; }
     Key min_key() const { return min_key_; }

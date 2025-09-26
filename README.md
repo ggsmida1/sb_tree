@@ -1,96 +1,73 @@
-SB-Tree（单线程、只追加阶段）
+SB-Tree 源码说明（当前进度 & 下一步计划）
+当前已完成（单线程 / 只追加阶段）
 
-目标：不考虑延迟/乱序数据，先完成顺序插入与查询（点查），并构建一个批量晋升、只追加的 B+ 风格搜索层。
+数据层
 
-架构概览
+顺序插入（单调递增）→ 段转换为一串 DataBlock → 尾插到全局链表。
 
-数据层（DataBlock 链）
-顺序插入的数据先聚集在段中，触发转换后切成一串 DataBlock 按顺序尾插到全局链表。每个块内用 N-ary 表 辅助查找。
+块内提供 N-ary 表 辅助查找与扫描（find / scan_from）。
 
-搜索层（SearchLayer，vector 版）
+搜索层（vector 版 B+ 风格）
 
-叶层 L0：为每个 DataBlock 记录 {min_key, ptr}。
+叶层 L0：记录 {min_key, DataBlock\*}。
 
-内层 L1/L2/...：当某层“新增条目”凑满扇出 F 时，批量晋升为父条目，父条目覆盖下层连续 F 个孩子。
+内层 L1/L2/…：新增条目凑满扇出 F 才做批量晋升；不足 F 的“尾巴”保留到下次（只追加，不分裂/合并）。
 
-未凑满 F 的“尾巴”保留到下次晋升（只追加，不分裂/合并）。
+find_candidate(k) 自顶向下在已覆盖区间做 floor（返回“最后一个 min_key ≤ k 的叶块”）。
 
-查询
+查询能力
 
-find_candidate(k)：自顶向下在已覆盖区间做 floor，返回“最后一个 min_key ≤ k 的叶块”。
+点查 lookup(k)：用搜索层定位候选 → 块内查找 → 未命中沿 next 右移兜底（覆盖尾巴场景）。
 
-lookup(k)：在候选块内查找；若未命中则沿 next() 右移兜底直到 next->min_key() > k。
+顺序扫描 scan_from(start, count)：候选定位 → 块内扫 → 跨块续扫（不倒退起点）。
 
-已完成
+区间扫描 scan_range(l, r)：候选定位 → 块内二分裁剪到 [l, r] → 跨块直到越界停。
 
-✅ 顺序插入（append-only），段转换 → DataBlock 链尾插。
+稳定性与测试
 
-✅ 搜索层自下而上批量晋升，扇出 F（默认 64，可配置）。
+gtest 用例：晋升规则（凑满 F 才晋升）、端到端查找、尾巴未晋升、综合 E2E。
 
-✅ 点查（lookup）：索引定位 + 块内 N-ary 查找 + next 兜底。
+手写测试：顺序插入/验证、scan_from/scan_range 覆盖跨块与尾部。
 
-✅ 基础测试（gtest + 手写测试）：
+Debug + ASan/LSan 排查修复过一次越界/悬挂引用问题；find_candidate 语义与尾巴场景对齐。
 
-凑满 F 才晋升（promotion）
+下一步建议路线图
 
-端到端查找（lookup）
+A. 功能完善
 
-尾巴未晋升（candidate & lookup 正确）
+区间扫描增强：提供回调/迭代器版本，避免一次性 materialize 大量结果。
 
-你原有的插入/验证用例均通过
+分页接口：基于 scan_from 增加游标（“最后一个 key”）以支持翻页。
 
-参数与不变量
+B. 延迟/乱序数据
 
-扇出 F：默认 64（构造 SearchLayer 时可设）。所有层使用相同 F。
+设计 delta/缓冲区（如 per-thread buffer 或 append-only delta list），后台归并到数据层。
 
-不变量（关键校验）
+确定合并触发策略与与搜索层批量晋升的衔接。
 
-L0 的 min_key 非降；
+C. 并发化
 
-每个父条目 child_begin..child_begin+child_count-1 在下层范围内，且 min_key == 第一个孩子的 min_key；
+索引构建专线线程：前端写入只进队列；后台批量 append_run。
 
-“推进指针”（已晋升到的位置）不越界；
+锁分层与读优化：数据层/索引层细粒度锁或读无锁；lookup 尽量走只读路径 + next 兜底。
 
-只有当新增条目数凑满 F 才晋升；不足 F 的尾部保留到下次。
+D. 结构抽象与工程化
 
-测试
+将 vector 版搜索层抽象为 SearchBlock，统一元数据（为持久化/并发做准备）。
 
-gtest 用例
+内存管理：明确 DataBlock 所有权、回收策略、长尾块清理。
 
-SearchLayerPromotion.OnlyPromoteWhenFullF：验证“凑满 F 才晋升”
+持久化 / 恢复：WAL + 快照；启动重建搜索层或加载索引元数据。
 
-SBTreeLookup.EndToEndOrderedKeys：端到端查找
+E. 性能与质量
 
-SearchLayerTailUnpromoted.CandidateWorks：尾巴未晋升
+参数调优：扇出 F、数据块大小、块内 N-ary 阶数。
 
-你原有的测试
+基准与监控：构建吞吐/延迟、levels()/各层大小、晋升批次、lookup/scan QPS。
 
-test_insert / test_single_insert：顺序插入 + 验证
+健壮性测试：随机多 run、边界键/洞洞键、Fuzz、压力与故障注入。
 
-手写示例（test_manual.cpp）演示插入 & 查找。
+小优化（可选）：find_candidate 尾端向右窥视一步，在尾巴场景下更快命中目标块；不同层使用不同 F。
 
-已知限制
-
-仅支持单线程路径（还未加并发/锁分层/专线索引线程）。
-
-暂不处理延迟/乱序数据（即“延迟数据”未插入到已有块中）。
-
-搜索层使用内存中的 vector 结构（SearchBlock 抽象与持久化尚未实现）。
-
-没有块合并/分裂（与“只追加、批量晋升”的策略一致）。
-
-没有持久化/恢复逻辑（仅内存型）。
-
-接下来要做
-
-优先级 A（功能闭环）
-
-Range Scan：scan(l, r, callback)（索引定位起点块 → 跨块扫描 → 早停）。
-
-延迟/乱序数据的暂存与合并策略（如 per-thread buffer / delta 区 + 后台归并）。
-
-SearchBlock 抽象：把 vector 版替换为块封装，统一元数据管理（为后续并发与持久化做准备）。
-
-优先级 B（并发 & 稳定性） 4. 索引构建专线线程：append_run 由单线程队列驱动；读路径只读索引 + next 兜底。 5. 锁分层/读优化：数据层读尽量无锁或细粒度锁，写在转换/接链处加短临界区。 6. 内存管理：明确 DataBlock 的所有权与生命周期（search 不持有，压缩/淘汰策略）。
-
-优先级 C（优化 & 工程化） 7. find_candidate 尾部向右窥视一步的小优化（可选，功能无依赖）。 8. 参数调优（F、块大小、N-ary 表阶数）；基准脚本。 9. 持久化/恢复（如快照+WAL），监控与统计（层大小、晋升次数、QPS、延迟等）。
+状态总结：
+当前已完成顺序插入 → 搜索层只追加构建 → 点查/扫描的单线程闭环，核心测试通过。建议先补回调版扫描与简单并发索引构建，再逐步落地延迟数据与持久化。
