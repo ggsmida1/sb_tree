@@ -195,35 +195,107 @@ size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
 {
     if (l > r)
         return 0;
+    auto cur = open_range_cursor(l, r);
+    size_t added = 0;
 
-    std::lock_guard<std::mutex> g(data_layer_lock_);
+    // 这里演示“逐条拉取然后 push value”，也可以写成批量
+    KVPair kv;
+    while (cur.next(&kv))
+    {
+        out.push_back(kv.value);
+        ++added;
+    }
+    return added;
+}
 
-    // 1) 用索引定位起点块（最后一个 min_key <= l），否则从链表头开始
+SBTree::RangeCursor SBTree::open_range_cursor(Key l, Key r) const
+{
+    if (l > r)
+        return RangeCursor(this, 1, 0, nullptr); // 空区间
     DataBlock *blk = search_.find_candidate(l);
     if (!blk)
         blk = data_head_;
+    return RangeCursor(this, l, r, blk);
+}
 
-    size_t taken_total = 0;
-
-    // 2) 跨块扫描，直到越过 r 或链表结束
-    while (blk)
+void SBTree::RangeCursor::seek_first_pos_()
+{
+    // 在当前块内二分到第一个 key >= l_
+    const std::size_t n = blk_->size();
+    std::size_t L = 0, R = n, pos = n;
+    while (L < R)
     {
-        // 当前块最小键若已 > r，后面更不可能有
-        if (blk->min_key() > r)
+        std::size_t mid = L + ((R - L) >> 1);
+        const KVPair &e = blk_->get_entry(mid);
+        if (e.key >= l_)
+        {
+            pos = mid;
+            R = mid;
+        }
+        else
+            L = mid + 1;
+    }
+    idx_ = pos;
+
+    // 若整块都 < l_，跳到下一块
+    while (blk_ && idx_ >= blk_->size())
+    {
+        blk_ = blk_->next();
+        if (!blk_ || blk_->min_key() > r_)
+        {
+            blk_ = nullptr;
             break;
+        }
+        idx_ = 0;
+    }
+}
 
-        taken_total += blk->scan_range(l, r, out);
+bool SBTree::RangeCursor::next(KVPair *out)
+{
+    if (!blk_)
+        return false;
 
-        // 右移
-        blk = blk->next();
-        if (!blk)
-            break;
-
-        // 保持 l 不变即可；块内 scan_range 会再做二分裁剪
-        // l = std::max(l, blk->min_key());  // 可选，等价
+    const std::size_t n = blk_->size();
+    while (idx_ < n)
+    {
+        const KVPair &e = blk_->get_entry(idx_++);
+        if (e.key > r_)
+        {
+            blk_ = nullptr;
+            return false;
+        } // 超出右界，结束
+        if (e.key >= l_)
+        {
+            if (out)
+                *out = e;
+            return true;
+        } // 命中
+        // e.key < l_：只会在首块发生，继续推进
     }
 
-    return taken_total;
+    // 跳到下一块
+    blk_ = blk_->next();
+    if (!blk_ || blk_->min_key() > r_)
+    {
+        blk_ = nullptr;
+        return false;
+    }
+    idx_ = 0;
+    return next(out); // 继续（尾递归）
+}
+
+size_t SBTree::RangeCursor::next_batch(std::vector<KVPair> &out, size_t limit)
+{
+    if (!blk_ || limit == 0)
+        return 0;
+    size_t added = 0;
+    KVPair kv;
+    while (added < limit && next(&kv))
+    {
+        out.push_back(kv);
+        ++added;
+    }
+    return added;
 }
 
 bool SBTree::verify_data_layer(size_t expected_total_keys) const

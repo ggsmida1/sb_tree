@@ -29,6 +29,44 @@ public:
 
     void flush(); // ++ 新增 flush 方法 ++
 
+    // === 区间游标：遍历 [l, r]，每次产出一个 KVPair ===
+    class RangeCursor
+    {
+    public:
+        // 取下一个元素；有则写入 out 并返回 true；否则返回 false
+        bool next(KVPair *out);
+
+        // 批量拉取：最多取 limit 条，追加到 out，返回本次追加条数
+        size_t next_batch(std::vector<KVPair> &out, size_t limit);
+
+        // 是否还有元素可读
+        inline bool valid() const noexcept { return blk_ != nullptr; }
+
+    private:
+        friend class SBTree;
+        RangeCursor(const SBTree *owner, Key l, Key r, DataBlock *start)
+            : owner_(owner), l_(l), r_(r), blk_(start), idx_(0)
+        {
+            if (!blk_ || blk_->min_key() > r_)
+            {
+                blk_ = nullptr;
+                return;
+            }
+            seek_first_pos_();
+        }
+
+        void seek_first_pos_(); // 在当前块内把 idx_ 定位到 >= l_ 的第一条
+
+    private:
+        const SBTree *owner_; // 单线程阶段仅作保留
+        Key l_, r_;
+        DataBlock *blk_;  // 当前块（只借用，不拥有）
+        std::size_t idx_; // 当前块内位置
+    };
+
+    // 打开 [l, r] 的区间游标
+    RangeCursor open_range_cursor(Key l, Key r) const;
+
 private:
     // ++ 新增私有辅助函数 ++
     void convert_and_append(SegmentedBlock *seg_to_convert);

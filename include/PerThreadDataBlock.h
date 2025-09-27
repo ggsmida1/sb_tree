@@ -22,7 +22,7 @@ public:
 
 private:
     // 固定块大小
-    static constexpr size_t kBlockSize = 4096;
+    static constexpr size_t kBlockSize = 16384;
 
     // 元数据
     size_t num_entries_;
