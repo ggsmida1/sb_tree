@@ -19,9 +19,7 @@ find_candidate(k) 自顶向下在已覆盖区间做 floor（返回“最后一�
 
 点查 lookup(k)：用搜索层定位候选 → 块内查找 → 未命中沿 next 右移兜底（覆盖尾巴场景）。
 
-顺序扫描 scan_from(start, count)：候选定位 → 块内扫 → 跨块续扫（不倒退起点）。
-
-区间扫描 scan_range(l, r)：候选定位 → 块内二分裁剪到 [l, r] → 跨块直到越界停。
+扫描 scan
 
 稳定性与测试
 

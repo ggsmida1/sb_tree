@@ -191,44 +191,7 @@ bool SBTree::lookup(Key k, Value *out) const
     return false; // 未命中
 }
 
-size_t SBTree::scan_from(Key start, size_t count, std::vector<Value> &out) const
-{
-    if (count == 0)
-        return 0;
-
-    std::lock_guard<std::mutex> g(data_layer_lock_);
-
-    // 1) 索引定位起点块；若索引为空/滞后，则退回链表头
-    DataBlock *blk = search_.find_candidate(start); // 候选块（最后一个 min_key <= start）
-    if (!blk)
-        blk = data_head_; // 兜底：从链表头开始
-
-    size_t remaining = count;
-    Key cur = start;
-    size_t taken_total = 0;
-
-    while (blk && remaining > 0)
-    {
-        // 2) 在当前块从 cur 开始扫描，最多 remaining 个
-        size_t got = blk->scan_from(cur, remaining, out); // 单块扫描（最多 remaining）
-        taken_total += got;
-        remaining -= got;
-
-        if (remaining == 0)
-            break;
-
-        // 3) 右移到下一块，更新下一块的起始 key
-        DataBlock *nxt = blk->next();
-        if (!nxt)
-            break;
-        // 保持 cur 不变（全局起点）；可选：cur = std::max(cur, nxt->min_key());
-        blk = nxt;
-    }
-
-    return taken_total;
-}
-
-size_t SBTree::scan_range(Key l, Key r, std::vector<Value> &out) const
+size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
 {
     if (l > r)
         return 0;

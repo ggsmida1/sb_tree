@@ -37,6 +37,4 @@ target_link_libraries(test_single_insert PRIVATE sb_tree Threads::Threads)
 add_executable(test_insert test_insert.cpp)
 target_link_libraries(test_insert PRIVATE sb_tree Threads::Threads)
 
-add_executable(test_manual test_manual.cpp)
-target_link_libraries(test_manual PRIVATE sb_tree Threads::Threads)
 

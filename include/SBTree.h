@@ -20,11 +20,8 @@ public:
     // 查找
     bool lookup(Key k, Value *out) const;
 
-    // 从 start 开始向右，最多取 count 个，结果追加到 out；返回实际条数
-    size_t scan_from(Key start, size_t count, std::vector<Value> &out) const;
-
-    // 扫描区间 [l, r]，把 value 追加到 out，返回追加条数
-    size_t scan_range(Key l, Key r, std::vector<Value> &out) const;
+    // 扫描
+    size_t scan(Key l, Key r, std::vector<Value> &out) const;
 
     // ++ 新增：用于测试的验证方法 ++
     // 遍历整个数据层，验证总数、顺序和数据正确性
