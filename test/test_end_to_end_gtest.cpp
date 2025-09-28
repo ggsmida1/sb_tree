@@ -1,6 +1,8 @@
 // test/test_end_to_end_gtest.cpp
 #include <gtest/gtest.h>
 #include <vector>
+#include <chrono>
+#include <thread>
 #include "SBTree.h"
 #include "KVPair.h"
 
@@ -221,5 +223,67 @@ TEST(EndToEnd, MultipleRunsStillCorrect)
         while (cur.next(&kv))
             got.push_back(kv);
         EXPECT_EQ(collect_values_from_pairs(got), seq_values(2995, 11));
+    }
+}
+
+TEST(AsyncIndexing, LookupScanCorrectBeforeAndAfterBarrier)
+{
+    SBTree t;
+
+    // 连续产生多批 run，让后台线程有工作量
+    const int runs = 8;
+    const Key per_run = 5000; // 每批 5k
+    Key base = 1;
+    for (int i = 0; i < runs; ++i)
+    {
+        for (Key k = base; k < base + per_run; ++k)
+            t.insert(k, static_cast<Value>(k * 10));
+        t.flush(); // 仅确保数据层完成（索引不等）
+        base += per_run;
+    }
+
+    // 已插入的最后一个 key
+    const Key last = base - 1;
+
+    // 打点（可选）
+    std::cout << "[test] enq=" << t.index_batches_enqueued()
+              << " appl=" << t.index_batches_applied()
+              << " levels=" << t.index_levels()
+              << " last=" << last << "\n";
+
+    // —— 不等待索引追平：lookup/scan 也应正确（靠候选+next 兜底）——
+    Value v{};
+    EXPECT_TRUE(t.lookup(1, &v));
+    EXPECT_EQ(v, 10);
+    EXPECT_TRUE(t.lookup(last, &v));
+    EXPECT_EQ(v, last * 10);
+    EXPECT_FALSE(t.lookup(base, &v)); // 超界 miss
+
+    {
+        std::vector<Value> out;
+        // 只扫到 last，期望 51 条：[last-50, last]
+        EXPECT_EQ(t.scan(last - 50, last, out), 51u);
+        ASSERT_FALSE(out.empty());
+        EXPECT_EQ(out.front(), static_cast<Value>((last - 50) * 10));
+        EXPECT_EQ(out.back(), static_cast<Value>(last * 10));
+    }
+
+    // —— 等待索引追平（barrier），再次验证：结果相同 ——
+    t.flush_index();
+    EXPECT_EQ(t.index_batches_enqueued(), t.index_batches_applied());
+    EXPECT_GE(t.index_levels(), 1u); // 可能 >1
+
+    EXPECT_TRUE(t.lookup(1, &v));
+    EXPECT_EQ(v, 10);
+    EXPECT_TRUE(t.lookup(last, &v));
+    EXPECT_EQ(v, last * 10);
+    EXPECT_FALSE(t.lookup(base, &v));
+
+    {
+        std::vector<Value> out;
+        EXPECT_EQ(t.scan(last - 50, last, out), 51u);
+        ASSERT_FALSE(out.empty());
+        EXPECT_EQ(out.front(), static_cast<Value>((last - 50) * 10));
+        EXPECT_EQ(out.back(), static_cast<Value>(last * 10));
     }
 }

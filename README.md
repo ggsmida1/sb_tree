@@ -1,71 +1,83 @@
-SB-Tree 源码说明（当前进度 & 下一步计划）
-当前已完成（单线程 / 只追加阶段）
+# SB-Tree：当前进度 & 下一步计划
 
-数据层
+> 目标：面向时序/递增键的内存索引。数据层只追加，搜索层批量晋升（B+ 风格）。
 
-顺序插入（单调递增）→ 段转换为一串 DataBlock → 尾插到全局链表。
+---
 
-块内提供 N-ary 表 辅助查找与扫描（find / scan_from）。
+## ✅ 已完成（不含延迟/乱序数据）
 
-搜索层（vector 版 B+ 风格）
+### 数据层（DataBlock）
 
-叶层 L0：记录 {min_key, DataBlock\*}。
+-   顺序插入（键单调递增）→ 收集排序 → 切成 `DataBlock` → **尾插**到全局链表。
+-   块内：N-ary 表 + 二分，支持 `find`、区间扫描切片。
+-   PTB（每线程缓冲）已从 **4KB** 调到 **16KB**，单次转换的 run 更大。
 
-内层 L1/L2/…：新增条目凑满扇出 F 才做批量晋升；不足 F 的“尾巴”保留到下次（只追加，不分裂/合并）。
+### 搜索层（SearchLayer，append-only）
 
-find_candidate(k) 自顶向下在已覆盖区间做 floor（返回“最后一个 min_key ≤ k 的叶块”）。
+-   叶层 L0：`{min_key, DataBlock*}`。
+-   内层 L1/L2/...：**凑满扇出 F(默认 64)** 才做**批量晋升**；尾巴不足 F 保留到下次（不分裂/不合并）。
+-   `find_candidate(k)`：父层 floor → 下钻到叶层。
 
-查询能力
+### 查询与扫描
 
-点查 lookup(k)：用搜索层定位候选 → 块内查找 → 未命中沿 next 右移兜底（覆盖尾巴场景）。
+-   `lookup(k, &v)`：**搜索层候选 + 块内 N-ary**；若未命中，**沿 next() 右移兜底**（覆盖尾巴未晋升）。
+-   `scan(l, r, out)`：区间扫描，块内二分裁剪 + 跨块续扫。
+-   **游标/迭代器**：`open_range_cursor(l, r)` + `RangeCursor::next/next_batch`（流式/分页/低内存）。
 
-扫描 scan
+### 异步索引构建（索引专线线程）
 
-稳定性与测试
+-   前台线程：完成数据层尾插后 **enqueue** 本次 run；  
+    后台线程：串行 `append_run`（独占写），读侧 `find_candidate` 走共享锁。
+-   提供 `flush_index()` barrier；统计指标（入队/应用批次数与条数、`levels()`）可读取。
 
-gtest 用例：晋升规则（凑满 F 才晋升）、端到端查找、尾巴未晋升、综合 E2E。
+### 测试覆盖（gtest）
 
-手写测试：顺序插入/验证、scan_from/scan_range 覆盖跨块与尾部。
+-   晋升规则（凑满 F 才晋升）、尾巴未晋升候选命中、端到端查找与扫描。
+-   游标与批量拉取：跨块、严格 ≤ r 截断、耗尽语义。
+-   **异步验证**：不等索引追平也能查对；`flush_index()` 后结果一致。
 
-Debug + ASan/LSan 排查修复过一次越界/悬挂引用问题；find_candidate 语义与尾巴场景对齐。
+---
 
-下一步建议路线图
+## 🧩 公开接口（核心）
 
-A. 功能完善
+-   插入：`insert(Key k, Value v)`, `flush()`
+-   点查：`bool lookup(Key k, Value* out) const`
+-   扫描：`size_t scan(Key l, Key r, std::vector<Value>& out) const`
+-   游标：`RangeCursor open_range_cursor(Key l, Key r) const`
+    -   `bool next(KVPair* out)`, `size_t next_batch(std::vector<KVPair>& out, size_t limit)`
+-   异步索引：`void flush_index()`（测试/基准用）
 
-区间扫描增强：提供回调/迭代器版本，避免一次性 materialize 大量结果。
+---
 
-分页接口：基于 scan_from 增加游标（“最后一个 key”）以支持翻页。
+## 🔜 下一步（建议按顺序推进）
 
-B. 延迟/乱序数据
+### 1) 并发插入——最小可用版（正确优先）
 
-设计 delta/缓冲区（如 per-thread buffer 或 append-only delta list），后台归并到数据层。
+-   数据层读写锁：`std::shared_mutex data_layer_mu_`
+    -   追加链表：`unique_lock`
+    -   读取链表：`shared_lock`
+-   转换粗锁：`std::mutex convert_mu_`（PTB 满 → 收集/排序/切块 → 追加 → 入队）
+-   多线程小测：2–4 线程、各插 5–10 万；`flush()` + `flush_index()` 后抽查 `lookup/scan`。
 
-确定合并触发策略与与搜索层批量晋升的衔接。
+### 2) 并发插入——迭代优化
 
-C. 并发化
+-   **PTB 双缓冲/小池**：满了先换新，旧的批量收集转换，缩短阻塞。
+-   **轻锁快照**：收集/排序放锁外；仅在“发布指针/尾插/入队”时短锁。
 
-索引构建专线线程：前端写入只进队列；后台批量 append_run。
+---
 
-锁分层与读优化：数据层/索引层细粒度锁或读无锁；lookup 尽量走只读路径 + next 兜底。
+## 🧭 后续路线（功能与工程化）
 
-D. 结构抽象与工程化
+-   **延迟/乱序数据**：per-thread delta/merge 策略，归并到数据层；与索引批量晋升对接。
+-   **搜索层抽象化**：从 `vector` 版过渡到 `SearchBlock`（统一元数据、为持久化/RCU 做准备）。
+-   **持久化与恢复**：WAL + 快照；启动时重建或加载搜索层。
+-   **API 增强**：游标分页游标/返回键值、可选回调版 `scan_cb`。
+-   **指标与调优**：扇出 F、块大小、N-ary 阶数；levels/批次/命中率/吞吐监控。
+-   **健壮性测试**：随机多 run、边界键/稀疏键、Fuzz、压力与失败注入。
 
-将 vector 版搜索层抽象为 SearchBlock，统一元数据（为持久化/并发做准备）。
+---
 
-内存管理：明确 DataBlock 所有权、回收策略、长尾块清理。
+## 📌 现状总结
 
-持久化 / 恢复：WAL + 快照；启动重建搜索层或加载索引元数据。
-
-E. 性能与质量
-
-参数调优：扇出 F、数据块大小、块内 N-ary 阶数。
-
-基准与监控：构建吞吐/延迟、levels()/各层大小、晋升批次、lookup/scan QPS。
-
-健壮性测试：随机多 run、边界键/洞洞键、Fuzz、压力与故障注入。
-
-小优化（可选）：find_candidate 尾端向右窥视一步，在尾巴场景下更快命中目标块；不同层使用不同 F。
-
-状态总结：
-当前已完成顺序插入 → 搜索层只追加构建 → 点查/扫描的单线程闭环，核心测试通过。建议先补回调版扫描与简单并发索引构建，再逐步落地延迟数据与持久化。
+-   已完成**顺序插入 → 异步索引 → 查找/扫描/游标**的单线程闭环，并通过异步一致性测试。
+-   现在可安全启动**并发插入（粗锁版）**，再逐步优化为更细粒度的并发实现。

@@ -1,6 +1,11 @@
 #pragma once
 #include <atomic>
-#include <mutex> // 新增头文件
+#include <mutex>
+#include <shared_mutex>
+#include <condition_variable>
+#include <atomic>
+#include <thread>
+#include <deque>
 #include "KVPair.h"
 #include "SegmentedBlock.h"
 #include "DataBlock.h"
@@ -67,9 +72,45 @@ public:
     // 打开 [l, r] 的区间游标
     RangeCursor open_range_cursor(Key l, Key r) const;
 
+    // 索引刷到位（barrier）
+    void flush_index();
+
+    // 仅测试/诊断：读取统计值与当前索引层数
+    uint64_t index_batches_enqueued() const noexcept;
+    uint64_t index_batches_applied() const noexcept;
+    uint64_t index_items_enqueued() const noexcept;
+    uint64_t index_items_applied() const noexcept;
+    std::size_t index_levels() const; // 读锁保护后转发 search_.levels()
+
 private:
     // ++ 新增私有辅助函数 ++
     void convert_and_append(SegmentedBlock *seg_to_convert);
+
+    // --- 读侧保护搜索层（先求稳，后续可优化到无锁/RCU） ---
+    mutable std::shared_mutex search_mu_;
+
+    // --- 索引专线线程 ---
+    std::thread index_thread_;
+    std::deque<std::vector<DataBlock *>> index_q_;
+    std::mutex q_mu_;
+    std::condition_variable q_cv_;
+    std::atomic<bool> index_stop_{false};
+
+    // 可选：用于 flush barrier 的飞行计数
+    std::atomic<size_t> index_in_flight_{0};
+
+    // 后台线程与入队
+    void index_worker_();
+    void enqueue_index_task_(std::vector<DataBlock *> &&blocks);
+
+    // 读侧包装（避免到处手动加锁）
+    DataBlock *find_candidate_locked_(Key k) const;
+
+    // --- 统计指标（仅测试/诊断用） ---
+    std::atomic<uint64_t> idx_batches_enqueued_{0};
+    std::atomic<uint64_t> idx_batches_applied_{0};
+    std::atomic<uint64_t> idx_items_enqueued_{0};
+    std::atomic<uint64_t> idx_items_applied_{0};
 
     Key max_key_{0};
     std::atomic<SegmentedBlock *> shortcut_; // 指向当前活跃分段块

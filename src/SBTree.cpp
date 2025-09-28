@@ -2,27 +2,48 @@
 #include <vector>
 #include <iostream>
 
+// ===== SBTree ctor/dtor =====
 SBTree::SBTree()
     : shortcut_(new SegmentedBlock()),
-      data_head_(nullptr), // 初始化
-      data_tail_(nullptr)  // 初始化
+      data_head_(nullptr),
+      data_tail_(nullptr)
 {
+    // 启动索引专线线程
+    index_stop_.store(false, std::memory_order_relaxed);
+    index_thread_ = std::thread(&SBTree::index_worker_, this);
 }
 
-// 实现析构函数，遍历并删除所有 DataBlock
 SBTree::~SBTree()
 {
-    // 确保在销毁前所有数据都被转换
+    // 1) 先把还在写的分段块转完并入队（数据层完成）
     flush();
 
-    // ... (删除 DataBlock 链表的代码) ...
-    DataBlock *current = data_head_;
-    while (current != nullptr)
+    // 2) 等待索引层把已入队的批次都处理完（barrier）
+    //    若你把 flush_index() 设为 private，也可以直接在这里调用。
+    flush_index();
+
+    // 3) 通知后台线程退出并 join
     {
-        DataBlock *next = current->next();
-        delete current;
-        current = next;
+        std::lock_guard<std::mutex> lk(q_mu_);
+        index_stop_.store(true, std::memory_order_release);
     }
+    q_cv_.notify_all();
+    if (index_thread_.joinable())
+        index_thread_.join();
+
+    // 4) 释放数据层链表
+    DataBlock *cur = data_head_;
+    while (cur)
+    {
+        DataBlock *nxt = cur->next();
+        delete cur;
+        cur = nxt;
+    }
+    data_head_ = data_tail_ = nullptr;
+
+    // 5) 释放分段块
+    delete shortcut_;
+    shortcut_ = nullptr;
 }
 
 // ++ 新增：将转换逻辑提取为辅助函数 ++
@@ -96,8 +117,62 @@ void SBTree::convert_and_append(SegmentedBlock *seg_to_convert)
     }
     std::cout << "Appended " << sorted_data.size() << " entries to the data layer.\n";
 
-    // 4) 搜索层：数据层尾插成功之后，再批量追加索引（保持“不领先”语义）
-    search_.append_run(new_blocks);
+    enqueue_index_task_(std::move(new_blocks));
+}
+
+void SBTree::enqueue_index_task_(std::vector<DataBlock *> &&blocks)
+{
+    if (blocks.empty())
+        return;
+
+    // 统计（入队）
+    idx_batches_enqueued_.fetch_add(1, std::memory_order_relaxed);
+    idx_items_enqueued_.fetch_add(blocks.size(), std::memory_order_relaxed);
+    std::cout << "[index][enqueue] blocks=" << blocks.size()
+              << " enq_batches=" << index_batches_enqueued()
+              << " enq_items=" << index_items_enqueued()
+              << " appl_batches=" << index_batches_applied()
+              << " appl_items=" << index_items_applied() << "\n";
+
+    {
+        std::lock_guard<std::mutex> lk(q_mu_);
+        index_q_.emplace_back(std::move(blocks));
+    }
+    q_cv_.notify_one();
+}
+
+void SBTree::index_worker_()
+{
+    for (;;)
+    {
+        std::vector<DataBlock *> batch;
+        {
+            std::unique_lock<std::mutex> lk(q_mu_);
+            q_cv_.wait(lk, [&]
+                       { return index_stop_.load(std::memory_order_acquire) || !index_q_.empty(); });
+            if (index_stop_.load(std::memory_order_acquire) && index_q_.empty())
+                break;
+            batch = std::move(index_q_.front());
+            index_q_.pop_front();
+            ++index_in_flight_;
+        }
+
+        {
+            std::unique_lock<std::shared_mutex> wlock(search_mu_);
+            search_.append_run(batch);
+        }
+
+        // 统计（应用完成）
+        idx_batches_applied_.fetch_add(1, std::memory_order_relaxed);
+        idx_items_applied_.fetch_add(batch.size(), std::memory_order_relaxed);
+        std::cout << "[index][applied] blocks=" << batch.size()
+                  << " levels=" << index_levels()
+                  << " enq_batches=" << index_batches_enqueued()
+                  << " appl_batches=" << index_batches_applied() << "\n";
+
+        --index_in_flight_;
+        q_cv_.notify_all();
+    }
 }
 
 // ++ 新增：实现 flush 方法 ++
@@ -113,6 +188,13 @@ void SBTree::flush()
         std::cout << "Flushing final SegmentedBlock...\n";
         convert_and_append(final_seg);
     }
+}
+
+void SBTree::flush_index()
+{
+    std::unique_lock<std::mutex> lk(q_mu_);
+    q_cv_.wait(lk, [&]
+               { return index_q_.empty() && (index_in_flight_.load() == 0); });
 }
 
 void SBTree::insert(Key key, Value value)
@@ -167,7 +249,7 @@ bool SBTree::lookup(Key k, Value *out) const
     std::lock_guard<std::mutex> g(data_layer_lock_);
 
     // 1) 先用搜索层定位候选块；若索引为空/滞后，则退回链表头
-    DataBlock *blk = search_.find_candidate(k);
+    DataBlock *blk = find_candidate_locked_(k);
     if (!blk)
         blk = data_head_;
 
@@ -208,11 +290,17 @@ size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
     return added;
 }
 
+DataBlock *SBTree::find_candidate_locked_(Key k) const
+{
+    std::shared_lock<std::shared_mutex> rlock(search_mu_);
+    return search_.find_candidate(k);
+}
+
 SBTree::RangeCursor SBTree::open_range_cursor(Key l, Key r) const
 {
     if (l > r)
         return RangeCursor(this, 1, 0, nullptr); // 空区间
-    DataBlock *blk = search_.find_candidate(l);
+    DataBlock *blk = find_candidate_locked_(l);
     if (!blk)
         blk = data_head_;
     return RangeCursor(this, l, r, blk);
@@ -354,4 +442,15 @@ bool SBTree::verify_data_layer(size_t expected_total_keys) const
     std::cout << "Verification PASSED: Found and verified " << actual_keys_count << " keys.\n";
     std::cout << "--- Verification Finished ---\n";
     return true;
+}
+
+uint64_t SBTree::index_batches_enqueued() const noexcept { return idx_batches_enqueued_.load(); }
+uint64_t SBTree::index_batches_applied() const noexcept { return idx_batches_applied_.load(); }
+uint64_t SBTree::index_items_enqueued() const noexcept { return idx_items_enqueued_.load(); }
+uint64_t SBTree::index_items_applied() const noexcept { return idx_items_applied_.load(); }
+
+std::size_t SBTree::index_levels() const
+{
+    std::shared_lock<std::shared_mutex> rlock(search_mu_);
+    return search_.levels();
 }
