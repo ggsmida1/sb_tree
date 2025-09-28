@@ -1,83 +1,89 @@
-# SB-Tree：当前进度 & 下一步计划
+# SB-Tree
 
-> 目标：面向时序/递增键的内存索引。数据层只追加，搜索层批量晋升（B+ 风格）。
-
----
-
-## ✅ 已完成（不含延迟/乱序数据）
-
-### 数据层（DataBlock）
-
--   顺序插入（键单调递增）→ 收集排序 → 切成 `DataBlock` → **尾插**到全局链表。
--   块内：N-ary 表 + 二分，支持 `find`、区间扫描切片。
--   PTB（每线程缓冲）已从 **4KB** 调到 **16KB**，单次转换的 run 更大。
-
-### 搜索层（SearchLayer，append-only）
-
--   叶层 L0：`{min_key, DataBlock*}`。
--   内层 L1/L2/...：**凑满扇出 F(默认 64)** 才做**批量晋升**；尾巴不足 F 保留到下次（不分裂/不合并）。
--   `find_candidate(k)`：父层 floor → 下钻到叶层。
-
-### 查询与扫描
-
--   `lookup(k, &v)`：**搜索层候选 + 块内 N-ary**；若未命中，**沿 next() 右移兜底**（覆盖尾巴未晋升）。
--   `scan(l, r, out)`：区间扫描，块内二分裁剪 + 跨块续扫。
--   **游标/迭代器**：`open_range_cursor(l, r)` + `RangeCursor::next/next_batch`（流式/分页/低内存）。
-
-### 异步索引构建（索引专线线程）
-
--   前台线程：完成数据层尾插后 **enqueue** 本次 run；  
-    后台线程：串行 `append_run`（独占写），读侧 `find_candidate` 走共享锁。
--   提供 `flush_index()` barrier；统计指标（入队/应用批次数与条数、`levels()`）可读取。
-
-### 测试覆盖（gtest）
-
--   晋升规则（凑满 F 才晋升）、尾巴未晋升候选命中、端到端查找与扫描。
--   游标与批量拉取：跨块、严格 ≤ r 截断、耗尽语义。
--   **异步验证**：不等索引追平也能查对；`flush_index()` 后结果一致。
+**SB-Tree (Segmented-Block Tree)** 是一种面向内存时间序列数据库的高吞吐索引结构。  
+本项目是一个参考实现，使用 **C++17 + CMake + GoogleTest**。
 
 ---
 
-## 🧩 公开接口（核心）
+## 已实现的功能
 
--   插入：`insert(Key k, Value v)`, `flush()`
--   点查：`bool lookup(Key k, Value* out) const`
--   扫描：`size_t scan(Key l, Key r, std::vector<Value>& out) const`
--   游标：`RangeCursor open_range_cursor(Key l, Key r) const`
-    -   `bool next(KVPair* out)`, `size_t next_batch(std::vector<KVPair>& out, size_t limit)`
--   异步索引：`void flush_index()`（测试/基准用）
+-   **两层结构**
+
+    -   **搜索层 (Search Layer)**：维护已转换数据块 (DataBlock) 的有序 runs，并支持追加。
+    -   **数据层 (Data Layer)**：由有序的 DataBlock 构成，支持点查与范围扫描。
+
+-   **插入操作 (Insert)**
+
+    -   新写入首先通过 **Shortcut** 找到当前活跃的分段块 (Segmented Block)。
+    -   写入落到该分段块中对应线程的 **Per-Thread Block (PTB)**。
+    -   如果 PTB **未满**：直接写入成功。
+    -   如果 PTB **填满**：
+        1. 当前写入仍会成功落到该 PTB；
+        2. 分段块立即被 **封印 (seal)**，不再接受新写入；
+        3. CAS 保证只有一个线程负责：收集所有 PTB → 排序 → 切分为 DataBlock → 尾插到数据层 → 更新搜索层；
+        4. 其余线程自动切换到新的分段块继续写入。
+    -   这样实现了 **写入与转换解耦**，保证高并发下写入不断流。
+
+-   **分段块 (Segmented Block) 管理**
+
+    -   每个分段块包含多个 **PTB**，线程本地写入，减少写入竞争。
+    -   **填满即封印 (seal-on-fill)**：当某个 PTB 被写满时，该分段块立即被封印，不再接受新写入。
+
+-   **转换机制**
+
+    -   被封印的分段块会收集所有 PTB 的数据，排序后切分成 DataBlock。
+    -   DataBlock 会尾插到数据层，并异步入队到搜索层。
+    -   保证数据层整体有序，支持 scan/lookup 的正确性。
+
+-   **只一个转换者**
+
+    -   使用 CAS 保证同时只有一个线程负责切段与转换，避免重复工作。
+
+-   **查询接口**
+
+    -   `lookup(key)`：点查。
+    -   `scan(L, R)`：范围扫描，支持跨块。
+
+-   **完整单元测试**
+    -   接缝无重复 (`RunSeam.NoDuplicateAtBoundary`)。
+    -   填满只触发一次转换 (`Conversion.OnlyOneConverterOnFill`)。
+    -   端到端正确性 (`EndToEnd.MultipleRunsStillCorrect`)。
+    -   异步索引一致性 (`AsyncIndexing.LookupScanCorrectBeforeAndAfterBarrier`)。
+    -   自探测 PTB 容量并验证语义 (`AutoDetect.SealOnFill`)。
+    -   全部通过 ✅。
 
 ---
 
-## 🔜 下一步（建议按顺序推进）
+## 未来可扩展功能
 
-### 1) 并发插入——最小可用版（正确优先）
+-   **延迟 / 乱序写入支持** (可不考虑)  
+    当前实现仅支持单调递增写入。后续可加入乱序数据缓冲与合并策略。
 
--   数据层读写锁：`std::shared_mutex data_layer_mu_`
-    -   追加链表：`unique_lock`
-    -   读取链表：`shared_lock`
--   转换粗锁：`std::mutex convert_mu_`（PTB 满 → 收集/排序/切块 → 追加 → 入队）
--   多线程小测：2–4 线程、各插 5–10 万；`flush()` + `flush_index()` 后抽查 `lookup/scan`。
+-   **读侧优化 (ROWEX)**  
+    将搜索层的读操作改为无锁读、写独占，提高多线程查询吞吐。
 
-### 2) 并发插入——迭代优化
+-   **块分配器与 NUMA 优化**  
+    自定义内存分配器，支持 NUMA-aware 分配和回收，降低内存管理开销。
 
--   **PTB 双缓冲/小池**：满了先换新，旧的批量收集转换，缩短阻塞。
--   **轻锁快照**：收集/排序放锁外；仅在“发布指针/尾插/入队”时短锁。
+-   **DataBlock 优化**
 
----
+    -   预取 / 向量化查找。
+    -   4KB 对齐，提升 cache 命中率。
+    -   自适应 N-ary 搜索表参数。
 
-## 🧭 后续路线（功能与工程化）
-
--   **延迟/乱序数据**：per-thread delta/merge 策略，归并到数据层；与索引批量晋升对接。
--   **搜索层抽象化**：从 `vector` 版过渡到 `SearchBlock`（统一元数据、为持久化/RCU 做准备）。
--   **持久化与恢复**：WAL + 快照；启动时重建或加载搜索层。
--   **API 增强**：游标分页游标/返回键值、可选回调版 `scan_cb`。
--   **指标与调优**：扇出 F、块大小、N-ary 阶数；levels/批次/命中率/吞吐监控。
--   **健壮性测试**：随机多 run、边界键/稀疏键、Fuzz、压力与失败注入。
+-   **混合负载测试与基准**  
+    添加长时间高并发基准，验证写吞吐、读延迟、尾延迟。
 
 ---
 
-## 📌 现状总结
+## 构建与运行
 
--   已完成**顺序插入 → 异步索引 → 查找/扫描/游标**的单线程闭环，并通过异步一致性测试。
--   现在可安全启动**并发插入（粗锁版）**，再逐步优化为更细粒度的并发实现。
+```bash
+# 配置与构建
+cmake -B build
+cmake --build build -j
+
+# 运行全部测试
+cd build
+ctest --output-on-failure
+```
