@@ -22,35 +22,83 @@ SegmentedBlock::~SegmentedBlock()
 
 bool SegmentedBlock::append_ordered(Key k, Value v)
 {
-    int slot = get_or_create_slot_for_this_thread_();
-    if (slot < 0)
+    // 仅 ACTIVE 时允许写入
+    if (status_.load(std::memory_order_acquire) != BlockStatus::ACTIVE)
     {
-        return false; // 本分段块已无空槽位
+        return false;
     }
-
-    PerThreadDataBlock *ptb = ptb_pointers_[static_cast<size_t>(slot)];
-
-    // 之前的实现中，get_or_create...保证了ptb非空，但现在由于缓存策略，
-    // 我们在此处再次检查ptb->Insert的返回值就足够了。
-    if (!ptb->Insert(k, v))
+    // （可选）PTB 槽位阈值
+    if (reserved_count_.load(std::memory_order_relaxed) >= kMaxPTBs)
     {
-        // 该线程的 PTB 已满
         return false;
     }
 
-    // 第一次写入或更小的 key 时更新 min_key_
-    // 使用 relaxed 内存序即可，因为它不用于同步
-    if (k < min_key_.load(std::memory_order_relaxed))
+    int slot = get_or_create_slot_for_this_thread_();
+    if (slot < 0)
+        return false;
+
+    PerThreadDataBlock *ptb = ptb_pointers_[slot];
+    if (ptb == nullptr)
     {
-        min_key_.store(k, std::memory_order_relaxed);
+        ptb = new PerThreadDataBlock();
+        ptb_pointers_[slot] = ptb;
+        reserved_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (ptb->IsFull())
+    {
+        return false; // 已满则交给上层切段
+    }
+
+    // —— 真正写入 ——（你原有的 Insert）
+    if (!ptb->Insert(k, v))
+    {
+        return false;
+    }
+
+    // 更新 min_key_（你原有的逻辑）
+    Key old_min = min_key_.load(std::memory_order_relaxed);
+    while (k < old_min &&
+           !min_key_.compare_exchange_weak(old_min, k,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed))
+    {
+    }
+
+    committed_count_.fetch_add(1, std::memory_order_relaxed);
+
+    // === 新增：如果“刚好被这次写入填满”，置 should_seal_ = true ===
+    if (ptb->IsFull())
+    {
+        should_seal_.store(true, std::memory_order_release);
     }
 
     return true;
 }
 
+void SegmentedBlock::seal()
+{
+    // --- 新增：把段置为 CONVERT（幂等），用于封印 ---
+    BlockStatus expected = BlockStatus::ACTIVE;
+    status_.compare_exchange_strong(
+        expected, BlockStatus::CONVERT,
+        std::memory_order_acq_rel, std::memory_order_acquire);
+    // 如果原本就不是 ACTIVE（比如已是 CONVERT/CONVERTED），保持幂等，无需报错
+}
+
 // ++ 新增方法的实现 ++
 std::vector<KVPair> SegmentedBlock::collect_and_sort_data()
 {
+    // --- 新增：转换阶段的互斥保护 ---
+    std::lock_guard<std::mutex> g(lock_);
+
+    // 最保险：确保处于 CONVERT（非必须，但利于诊断）
+    if (status_.load(std::memory_order_acquire) == BlockStatus::ACTIVE)
+    {
+        // 若还没封印，先封印（幂等）
+        seal();
+    }
+
     std::vector<KVPair> all_data;
 
     // 1. 预计算总大小并 reserve，提升性能

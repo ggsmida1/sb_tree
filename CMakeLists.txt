@@ -8,7 +8,7 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # 方便 VSCode 找 includePath
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 库
 add_library(sb_tree
@@ -22,7 +22,7 @@ target_include_directories(sb_tree PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 find_package(Threads REQUIRED)
 
-# ---- GoogleTest（FetchContent）----
+# GoogleTest（顶层拉取一次）
 include(FetchContent)
 FetchContent_Declare(
   googletest

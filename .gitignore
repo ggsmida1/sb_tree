@@ -1,5 +1,29 @@
-# 忽略 build 目录下所有内容
+# 构建目录
 build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+Makefile
 
-# VS Code 本地配置
+# 编译产物
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+
+# VSCode 本地配置
 .vscode/
+
+# 系统临时文件
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

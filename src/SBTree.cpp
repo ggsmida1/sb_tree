@@ -199,47 +199,68 @@ void SBTree::flush_index()
 
 void SBTree::insert(Key key, Value value)
 {
-    while (true)
+    for (;;)
     {
         SegmentedBlock *seg = shortcut_.load(std::memory_order_acquire);
 
-        // 增加一个检查，如果 shortcut_ 在 flush 后变成 nullptr，就创建一个新的
-        if (!seg)
+        // 1) 先尝试在当前活跃段写入
+        if (seg && seg->append_ordered(key, value))
         {
-            seg = new SegmentedBlock();
-            SegmentedBlock *expected = nullptr;
-            // 尝试将新的 block 放入 shortcut_，如果失败说明已有其他线程放入
-            if (!shortcut_.compare_exchange_strong(expected, seg))
+            // 可选：维护 max_key_
+            if (key > max_key_)
             {
-                delete seg; // 别的线程赢了，删除自己创建的
+                max_key_ = key;
             }
-            // 重新加载 seg 继续循环
-            continue;
+
+            // === 新增：如果刚被写满，则“立刻切段并转换旧段” ===
+            if (seg->should_seal())
+            {
+                auto *new_seg = new SegmentedBlock();
+                SegmentedBlock *expected = seg;
+                if (shortcut_.compare_exchange_strong(expected, new_seg,
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_acquire))
+                {
+                    // 我们赢了：封印旧段并转换
+                    seg->seal();             // ACTIVE -> CONVERT（幂等）
+                    convert_and_append(seg); // 收集→排序→切片→尾插数据层→索引入队
+                    // 你的 convert_and_append 内会负责释放旧段（按你现有实现）
+                }
+                else
+                {
+                    // 别的线程已经切好了
+                    delete new_seg;
+                }
+            }
+
+            return; // 本次 key 已写成功（即使我们触发了切段也已经写完了）
         }
 
-        if (seg->append_ordered(key, value))
-        {
-            return;
-        }
-
-        SegmentedBlock *new_seg = new SegmentedBlock();
+        // 2) 到这里说明 seg 不存在或拒写（非 ACTIVE / 槽满 / 已满）
+        //    准备一个新段并尝试切换
+        auto *new_seg = new SegmentedBlock();
         SegmentedBlock *expected = seg;
-        if (shortcut_.compare_exchange_weak(
-                expected, new_seg,
-                std::memory_order_acq_rel, std::memory_order_acquire))
+        if (shortcut_.compare_exchange_strong(expected, new_seg,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
         {
-            // 转换逻辑现在由辅助函数完成
-            convert_and_append(expected);
-
-            if (!new_seg->append_ordered(key, value))
-            { /* ... */
+            // CAS 成功：封印旧段并转换（如有旧段）
+            if (seg)
+            {
+                seg->seal();
+                convert_and_append(seg);
             }
+            // 把当前 key 写到新段里 —— 然后立刻返回，避免重复写
+            bool ok = new_seg->append_ordered(key, value);
+            (void)ok; // 或者 assert(ok);
             return;
         }
         else
         {
             delete new_seg;
         }
+
+        // 回到 for(;;) 重试
     }
 }
 

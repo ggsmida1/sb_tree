@@ -26,13 +26,24 @@ public:
     SegmentedBlock();
     ~SegmentedBlock();
 
-    // 顺序插入：为“当前线程”获取/创建一个 PTB，然后尝试写入。
-    // 返回 true 表示写入成功；返回 false 表示本分段块已不再接受写入
-    // （例如没有空槽位或该线程的 PTB 已满，外层应切换到新分段块）。
+    // 顺序插入：仅 ACTIVE 状态下接受写入；否则返回 false
     bool append_ordered(Key k, Value v);
 
     // 收集所有 PTB 中的数据，合并到一个 vector 并排序后返回。
     std::vector<KVPair> collect_and_sort_data();
+
+    // === 新增：封印（进入转换态），以及只读状态查询 ===
+    void seal(); // 将状态从 ACTIVE 置为 CONVERT（幂等）
+    BlockStatus status() const
+    {
+        return status_.load(std::memory_order_acquire);
+    }
+
+    // === 新增：是否需要封印（由“把 PTB 写满的那次写入”设置） ===
+    bool should_seal() const noexcept
+    {
+        return should_seal_.load(std::memory_order_acquire);
+    }
 
 private:
     // 为“当前线程”分配一个专属 PTB 槽位（第一次调用时分配）。
@@ -55,4 +66,7 @@ private:
     // 指向每线程数据块的指针
     static constexpr size_t kMaxPTBs = 128;
     PerThreadDataBlock *ptb_pointers_[kMaxPTBs];
+
+    // === 新增：由“写满”的那次写入置位；insert() 成功后由上层检查并触发切段 ===
+    std::atomic<bool> should_seal_{false};
 };
