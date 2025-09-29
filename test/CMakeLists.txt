@@ -15,6 +15,7 @@ add_sbtest(test_tail_unpromoted_gtest               test_tail_unpromoted_gtest.c
 add_sbtest(test_end_to_end_gtest                    test_end_to_end_gtest.cpp)
 add_sbtest(test_run_seam_and_conversion_gtest       test_run_seam_and_conversion_gtest.cpp)
 add_sbtest(test_autodetect_capacity_gtest test_autodetect_capacity_gtest.cpp)
+add_sbtest(test_concurrent_insert_gtest test_concurrent_insert_gtest.cpp)
 
 # 两个非-gtest 的可执行（保持原样）
 add_executable(test_single_insert test_single_insert.cpp)
