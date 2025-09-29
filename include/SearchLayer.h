@@ -4,50 +4,51 @@
 #include <cstdint>
 #include <cassert>
 #include <memory>
-#include "KVPair.h" // for Key
+#include "KVPair.h" // 定义 Key 类型
 
-class DataBlock; // fwd decl
+class DataBlock; // 前向声明
 
-// ============================================================================
-// SearchLayer — 批量晋升 / 只追加 的 B+ 风格搜索层（单线程阶段）
-// ----------------------------------------------------------------------------
-// 设计要点：
-//  - L0（叶层）：每个条目对应一个 DataBlock 的摘要 {min_key, ptr}
-//  - L1/L2/…（内层）：父条目汇总下层“连续 F 个”孩子，记录
-//        {min_key_of_group, child_begin, child_count=F}
-//  - append_run(blocks)：先把本次 run 的块追加到 L0，然后自下而上按扇出 F
-//    对“新增的条目”做批量晋升；不足 F 的“尾巴”保留到下次。
-//  - find_candidate(k)：若有内层，从最高层开始二分下钻到 L0；否则直接在 L0
-//    二分得到候选块指针；块内未命中由上层沿数据层 next 兜底。
-//  - 单线程阶段：本类不做并发同步；后续可在 append_run 外层做队列＋专线线程。
-// ============================================================================
+// -----------------------------------------------------------------------------
+// SearchLayer
+// -----------------------------------------------------------------------------
+// 作用：
+// - 数据层上方的搜索层，类似 B+ 树的索引部分。
+// - L0 层（叶层）保存 DataBlock 的摘要 {min_key, 指针}。
+// - L1/L2/... 层是内层节点，按固定扇出 fanout 聚合子节点。
+// - 提供批量追加（append_run）和候选定位（find_candidate）。
+// 并发语义：
+// - 搜索层的写入由后台专用线程维护（append_run 时批量晋升）；
+// - 其他工作线程只读搜索层，可并发安全访问；
+// - 这样避免了搜索层上的写入冲突，整体并发由数据层承担。
+// 不变式：
+// - L0 中条目按 min_key 非降；
+// - 内层节点的 min_key 等于其覆盖的第一个子节点的 min_key；
+// - promoted_ 记录各层已经完成晋升的位置。
+// -----------------------------------------------------------------------------
 class SearchLayer
 {
 public:
-    // ----------------------------- 公共类型 ---------------------------------
+    // ----------------------------- 公共结构体 --------------------------------
     struct LeafEnt
     {
-        Key min_key;    // 叶条目的下界（对应 DataBlock::min_key）
+        Key min_key;    // 对应 DataBlock 的最小 key
         DataBlock *ptr; // 指向数据块
     };
+
     struct NodeEnt
     {
-        Key min_key;             // 该父条目覆盖的子区间的最小 key（取首子条目）
-        std::size_t child_begin; // 在下层数组中的起始下标（连续）
-        std::size_t child_count; // = fanout_（固定扇出）
+        Key min_key;             // 覆盖区间的最小 key（取首子节点）
+        std::size_t child_begin; // 在下层数组中的起始下标
+        std::size_t child_count; // 覆盖的子节点数量（= fanout_）
     };
 
-    // SearchLayer.h
     struct SearchSnapshot
     {
         std::vector<LeafEnt> L0;             // 叶层快照
         std::vector<std::vector<NodeEnt>> L; // 内层快照
     };
 
-    // index_levels() 读快照
-    std::size_t levels_snapshot() const noexcept;
-
-    // ----------------------------- 构造/基本 ---------------------------------
+    // ----------------------------- 构造/析构 --------------------------------
     explicit SearchLayer(std::size_t fanout = 64);
     ~SearchLayer() = default;
 
@@ -56,49 +57,47 @@ public:
     SearchLayer(SearchLayer &&) = default;
     SearchLayer &operator=(SearchLayer &&) = default;
 
-    // ----------------------------- 追加/查询 ---------------------------------
-    // 批量追加：一次段转换产出的 run（blocks 已按 min_key 非降，且已整批尾插到数据层）
+    // ----------------------------- 追加接口 ---------------------------------
+    // 批量追加：一次段转换产出的 DataBlock* run（已按 min_key 有序）
     void append_run(const std::vector<DataBlock *> &blocks);
 
-    // 候选定位：返回“最后一个 min_key <= k”的 DataBlock*；若没有，返回 nullptr。
+    // ----------------------------- 查询接口 ---------------------------------
+    // 查找候选：返回“最后一个 min_key <= k”的 DataBlock*，否则 nullptr
     DataBlock *find_candidate(Key k) const noexcept;
 
-    // ----------------------------- 工具/状态 ---------------------------------
-    inline bool empty() const noexcept { return L0_.empty(); }
-    inline std::size_t leaf_size() const noexcept { return L0_.size(); }
-    inline std::size_t levels() const noexcept { return L_.size() + 1; } // 含叶层
-    inline std::size_t fanout() const noexcept { return fanout_; }
-    void clear();
+    // ----------------------------- 工具/状态 --------------------------------
+    bool empty() const noexcept { return L0_.empty(); }           // 是否为空
+    std::size_t leaf_size() const noexcept { return L0_.size(); } // 叶层条目数
+    std::size_t levels() const noexcept { return L_.size() + 1; } // 总层数（含叶层）
+    std::size_t fanout() const noexcept { return fanout_; }       // 返回扇出因子
+    void clear();                                                 // 清空全部内容
+
+    // 返回当前快照的层级数（测试/调试用）
+    std::size_t levels_snapshot() const noexcept;
 
 private:
     // ----------------------------- 内部帮助 ---------------------------------
-    // 断言：本次 run 的块按 min_key 非降
     static void debug_verify_sorted_leaf_run_(const std::vector<DataBlock *> &blocks);
+    void promote_from_level_(std::size_t level); // 从某层开始尝试晋升
 
-    // 从给定层（level=0 表示叶层 L0_）开始，尽可能把“新增的条目”按扇出 F 晋升到上一层
-    void promote_from_level_(std::size_t level);
-
-    // 在父层 vector 上做“最后一个 min_key <= k”的二分；返回下标或 (size_t)-1
+    // 二分查找：父层节点数组，返回“最后一个 min_key <= k”的下标
     static std::size_t upper_floor_index_(const std::vector<NodeEnt> &arr, Key k) noexcept;
 
-    // 在叶层指定区间 [lo, hi) 做“最后一个 min_key <= k”的二分；返回下标或 (size_t)-1
+    // 二分查找：叶层区间 [lo,hi)，返回“最后一个 min_key <= k”的下标
     static std::size_t leaf_floor_index_(const std::vector<LeafEnt> &arr,
-                                         std::size_t lo, std::size_t hi, Key k) noexcept;
+                                         std::size_t lo, std::size_t hi,
+                                         Key k) noexcept;
+
+    // 重新构建快照（仅写线程调用）
+    void rebuild_snapshot_();
 
 private:
-    // 层级存储
+    // ----------------------------- 成员变量 ---------------------------------
     std::vector<LeafEnt> L0_;             // 叶层
-    std::vector<std::vector<NodeEnt>> L_; // L_[0]=L1, L_[1]=L2, …（可能为空）
+    std::vector<std::vector<NodeEnt>> L_; // 内层（L1,L2,...）
+    std::vector<std::size_t> promoted_;   // 各层的晋升进度指针
 
-    // 每层“已晋升到的位置”（推进指针）：
-    // promoted_[0] 对应 L0_，promoted_[i] 对应 L_[i-1]
-    std::vector<std::size_t> promoted_;
+    std::size_t fanout_ = 64; // 固定扇出
 
-    std::size_t fanout_ = 64;
-
-    // === 新增：快照指针（C++17：用 atomic_* 操作 shared_ptr）===
-    std::shared_ptr<const SearchSnapshot> snapshot_;
-
-    // === 新增：在写入/晋升后重建快照（仅写线程调用）===
-    void rebuild_snapshot_();
+    std::shared_ptr<const SearchSnapshot> snapshot_; // 快照指针
 };
