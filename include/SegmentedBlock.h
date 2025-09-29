@@ -76,7 +76,6 @@ private:
     // ========================= 元数据与状态 =========================
     std::atomic<BlockStatus> status_; // 块状态：ACTIVE/CONVERT/CONVERTED
     std::atomic<Key> min_key_;        // 本段观测到的最小 key（用于顺序性/断言）
-    SegmentedBlock *next_block_;      // 指向数据层的后继段（由上层维护）
     std::mutex lock_;                 // 转换阶段的互斥（保护收集/排序等临界区）
 
     // ========================= PTB 分配计数 =========================

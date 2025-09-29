@@ -5,7 +5,6 @@
 SegmentedBlock::SegmentedBlock()
     : status_(BlockStatus::ACTIVE),
       min_key_(UINT64_MAX),
-      next_block_(nullptr),
       reserved_count_(0),
       committed_count_(0)
 {

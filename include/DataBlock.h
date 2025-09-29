@@ -89,7 +89,7 @@ private:
     std::pair<size_t, size_t> bucket_range_(Key k) const; // 计算 key 所在桶的 [l,r)
 
     // ========================= 元数据字段 =========================
-    Status status_ = Status::READY;                 // 块状态
+    Status status_ = Status::READY;                 // 块状态（预留）
     Key min_key_ = std::numeric_limits<Key>::max(); // 块内最小 key
     DataBlock *next_ = nullptr;                     // 指向后继 DataBlock
     LockWord lock_ = 0;                             // 轻量锁（预留）
