@@ -1,5 +1,6 @@
 #include "SearchLayer.h"
 #include "DataBlock.h"
+#include <atomic>
 #include <algorithm>
 
 // ===== 内部断言：本次 run 的块按 min_key 非降 =====
@@ -16,6 +17,35 @@ void SearchLayer::debug_verify_sorted_leaf_run_(const std::vector<DataBlock *> &
         prev = cur;
     }
 #endif
+}
+
+SearchLayer::SearchLayer(std::size_t fanout)
+    : fanout_(fanout)
+{
+    assert(fanout_ >= 2 && "fanout must be >= 2");
+    auto init = std::make_shared<SearchSnapshot>(); // 嵌套类型，作用域内可见
+    std::atomic_store(&snapshot_,
+                      std::static_pointer_cast<const SearchSnapshot>(init));
+}
+
+void SearchLayer::rebuild_snapshot_()
+{
+    auto snap = std::make_shared<SearchSnapshot>();
+    snap->L0 = L0_; // 现在类型一致，可以直接拷贝
+    snap->L = L_;   // 直接拷贝所有层
+
+    std::atomic_store(&snapshot_,
+                      std::static_pointer_cast<const SearchSnapshot>(snap));
+}
+
+// 层数 = 0（空树）或 1（仅叶层）或 1 + 内层数
+std::size_t SearchLayer::levels_snapshot() const noexcept
+{
+    auto snap = std::atomic_load(&snapshot_);
+    if (!snap)
+        return 0;
+    return snap->L.empty() ? (snap->L0.empty() ? 0u : 1u)
+                           : static_cast<std::size_t>(snap->L.size() + 1);
 }
 
 // ===== 清空所有层 =====
@@ -212,66 +242,66 @@ void SearchLayer::append_run(const std::vector<DataBlock *> &blocks)
         }
     }
 #endif
+    // === 新增：最后重建快照 ===
+    rebuild_snapshot_();
 }
 
 // ===== 自顶向下查找候选块 =====
 DataBlock *SearchLayer::find_candidate(Key k) const noexcept
 {
-    if (L0_.empty())
+    // 1) 读取只读快照（无锁）
+    auto snap = std::atomic_load(&snapshot_);
+    if (!snap || snap->L0.empty())
         return nullptr;
+
+    const auto &L0 = snap->L0;
+    const auto &L = snap->L;
 
     const auto npos = static_cast<std::size_t>(-1);
 
-    // 无内层：直接叶层 floor
-    if (L_.empty())
+    // 2) 无内层：直接在叶层做 floor
+    if (L.empty())
     {
-        std::size_t pos = leaf_floor_index_(L0_, 0, L0_.size(), k);
-        return (pos == npos) ? nullptr : L0_[pos].ptr;
+        std::size_t pos = leaf_floor_index_(L0, 0, L0.size(), k);
+        return (pos == npos) ? nullptr : L0[pos].ptr;
     }
 
-    // 从最高层开始
-    std::size_t top = L_.size() - 1;
+    // 3) 从最高层开始向下二分
+    std::size_t top = L.size() - 1;
     std::size_t lo = 0, hi = 0;
 
-    // 顶层父项（覆盖的是下一层的连续区间）
-    const auto &topv = L_[top];
+    const auto &topv = L[top];
     std::size_t idx = upper_floor_index_(topv, k);
     if (idx == npos)
-    {
-        // 比第一个父项的 min_key 还小 → 无候选
-        return nullptr;
-    }
+        return nullptr; // 小于全局最小 key
+
     lo = topv[idx].child_begin;
     hi = lo + topv[idx].child_count;
 
-    // 逐层向下选择“子父项”
     for (std::size_t lv = top; lv > 0; --lv)
     {
-        const auto &nodes = L_[lv - 1];
-        std::size_t L = lo, R = hi, pos = npos;
-        while (L < R)
+        const auto &nodes = L[lv - 1];
+        std::size_t Lb = lo, Rb = hi, pos = npos;
+        while (Lb < Rb)
         {
-            std::size_t mid = L + ((R - L) >> 1);
+            std::size_t mid = Lb + ((Rb - Lb) >> 1);
             if (nodes[mid].min_key <= k)
             {
                 pos = mid;
-                L = mid + 1;
+                Lb = mid + 1;
             }
             else
             {
-                R = mid;
+                Rb = mid;
             }
         }
         if (pos == npos)
-        {
-            // k 小于该父项子区间的第一个孩子 → 无候选
-            return nullptr;
-        }
+            return nullptr; // 小于该父区间的首子项
         lo = nodes[pos].child_begin;
         hi = lo + nodes[pos].child_count;
     }
 
-    // 到达叶层：在 [lo, hi) 上做 floor
-    std::size_t leaf_pos = leaf_floor_index_(L0_, lo, hi, k);
-    return (leaf_pos == npos) ? nullptr : L0_[leaf_pos].ptr;
+    // 4) 到达叶层：[lo,hi) 上做 floor
+    std::size_t leaf_pos = leaf_floor_index_(L0, lo, hi, k);
+    return (leaf_pos == npos) ? nullptr : L0[leaf_pos].ptr;
 }

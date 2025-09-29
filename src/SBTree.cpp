@@ -311,9 +311,11 @@ size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
     return added;
 }
 
+// 之前是：加 shared_lock 再调 search_.find_candidate(k)
+// 现在：SearchLayer::find_candidate 已经读无锁了，这里直接转发即可。
 DataBlock *SBTree::find_candidate_locked_(Key k) const
 {
-    std::shared_lock<std::shared_mutex> rlock(search_mu_);
+    // no lock needed: SearchLayer uses snapshot (ROWEX) for readers
     return search_.find_candidate(k);
 }
 
@@ -472,6 +474,5 @@ uint64_t SBTree::index_items_applied() const noexcept { return idx_items_applied
 
 std::size_t SBTree::index_levels() const
 {
-    std::shared_lock<std::shared_mutex> rlock(search_mu_);
-    return search_.levels();
+    return search_.levels_snapshot();
 }

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cassert>
+#include <memory>
 #include "KVPair.h" // for Key
 
 class DataBlock; // fwd decl
@@ -36,11 +37,18 @@ public:
         std::size_t child_count; // = fanout_（固定扇出）
     };
 
-    // ----------------------------- 构造/基本 ---------------------------------
-    explicit SearchLayer(std::size_t fanout = 64) : fanout_(fanout)
+    // SearchLayer.h
+    struct SearchSnapshot
     {
-        assert(fanout_ >= 2 && "fanout must be >= 2");
-    }
+        std::vector<LeafEnt> L0;             // 叶层快照
+        std::vector<std::vector<NodeEnt>> L; // 内层快照
+    };
+
+    // index_levels() 读快照
+    std::size_t levels_snapshot() const noexcept;
+
+    // ----------------------------- 构造/基本 ---------------------------------
+    explicit SearchLayer(std::size_t fanout = 64);
     ~SearchLayer() = default;
 
     SearchLayer(const SearchLayer &) = delete;
@@ -87,4 +95,10 @@ private:
     std::vector<std::size_t> promoted_;
 
     std::size_t fanout_ = 64;
+
+    // === 新增：快照指针（C++17：用 atomic_* 操作 shared_ptr）===
+    std::shared_ptr<const SearchSnapshot> snapshot_;
+
+    // === 新增：在写入/晋升后重建快照（仅写线程调用）===
+    void rebuild_snapshot_();
 };

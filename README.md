@@ -1,11 +1,11 @@
 # SB-Tree
 
 **SB-Tree (Segmented-Block Tree)** 是一种面向内存时间序列数据库的高吞吐索引结构。  
-本项目是一个参考实现，使用 **C++17 + CMake + GoogleTest**。
+本项目实现了论文提出的核心机制，使用 **C++17 + CMake + GoogleTest**。
 
 ---
 
-## 已实现的功能
+## 已实现功能
 
 -   **两层结构**
 
@@ -14,76 +14,60 @@
 
 -   **插入操作 (Insert)**
 
-    -   新写入首先通过 **Shortcut** 找到当前活跃的分段块 (Segmented Block)。
-    -   写入落到该分段块中对应线程的 **Per-Thread Block (PTB)**。
-    -   如果 PTB **未满**：直接写入成功。
-    -   如果 PTB **填满**：
-        1. 当前写入仍会成功落到该 PTB；
-        2. 分段块立即被 **封印 (seal)**，不再接受新写入；
-        3. CAS 保证只有一个线程负责：收集所有 PTB → 排序 → 切分为 DataBlock → 尾插到数据层 → 更新搜索层；
-        4. 其余线程自动切换到新的分段块继续写入。
-    -   这样实现了 **写入与转换解耦**，保证高并发下写入不断流。
+    -   新写入首先定位当前活跃的分段块 (Segmented Block)，落到对应线程的 Per-Thread Block (PTB)。
+    -   当 PTB 填满时，整个分段块立即封印并转换：收集所有 PTB → 排序 → 切分为 DataBlock → 尾插到数据层 → 搜索层追加 run。
+    -   CAS 保证只有一个线程执行转换，其他线程立即切换到新分段块继续写入。
+    -   这样实现了 **写入与转换解耦**，提高了并发写入效率。
 
--   **分段块 (Segmented Block) 管理**
+-   **并发语义**
 
-    -   每个分段块包含多个 **PTB**，线程本地写入，减少写入竞争。
-    -   **填满即封印 (seal-on-fill)**：当某个 PTB 被写满时，该分段块立即被封印，不再接受新写入。
-
--   **转换机制**
-
-    -   被封印的分段块会收集所有 PTB 的数据，排序后切分成 DataBlock。
-    -   DataBlock 会尾插到数据层，并异步入队到搜索层。
-    -   保证数据层整体有序，支持 scan/lookup 的正确性。
-
--   **只一个转换者**
-
-    -   使用 CAS 保证同时只有一个线程负责切段与转换，避免重复工作。
+    -   **Insert vs Insert**：每线程写 PTB，避免锁竞争；封印-转换由单线程负责，保证全局有序。
+    -   **Insert vs Lookup/Scan**：
+        -   转换完成后，搜索层会发布新的快照 (snapshot)。
+        -   查询 (`lookup` / `scan`) 无锁读取快照，访问不可变的 DataBlock。
+        -   写线程独占发布新快照，保证快照切换一致性。
+    -   当前实现支持 **高并发插入** 与 **无锁查询**，在多线程下保持正确性和稳定性。
 
 -   **查询接口**
 
     -   `lookup(key)`：点查。
     -   `scan(L, R)`：范围扫描，支持跨块。
 
--   **完整单元测试**
-    -   接缝无重复 (`RunSeam.NoDuplicateAtBoundary`)。
-    -   填满只触发一次转换 (`Conversion.OnlyOneConverterOnFill`)。
-    -   端到端正确性 (`EndToEnd.MultipleRunsStillCorrect`)。
-    -   异步索引一致性 (`AsyncIndexing.LookupScanCorrectBeforeAndAfterBarrier`)。
-    -   自探测 PTB 容量并验证语义 (`AutoDetect.SealOnFill`)。
-    -   全部通过 ✅。
+-   **单元测试覆盖**
+    -   run 接缝正确性（无重复/遗漏）。
+    -   转换过程中只允许一个线程负责。
+    -   多轮插入后全局有序性验证。
+    -   异步索引正确性。
+    -   并发插入与查询场景下的稳定性。
+    -   全部测试均已通过 ✅。
 
 ---
 
-## 未来可扩展功能
+## 未来可考虑功能
 
--   **延迟 / 乱序写入支持** (可不考虑)  
-    当前实现仅支持单调递增写入。后续可加入乱序数据缓冲与合并策略。
+-   **块级优化**
 
--   **读侧优化 (ROWEX)**  
-    将搜索层的读操作改为无锁读、写独占，提高多线程查询吞吐。
+    -   DataBlock 内部支持预取与向量化查找。
+    -   4KB 对齐以改善缓存命中率。
+    -   N-ary 搜索表参数的自适应调优。
 
--   **块分配器与 NUMA 优化**  
-    自定义内存分配器，支持 NUMA-aware 分配和回收，降低内存管理开销。
-
--   **DataBlock 优化**
-
-    -   预取 / 向量化查找。
-    -   4KB 对齐，提升 cache 命中率。
-    -   自适应 N-ary 搜索表参数。
-
--   **混合负载测试与基准**  
-    添加长时间高并发基准，验证写吞吐、读延迟、尾延迟。
+-   **工程优化**
+    -   内存分配器优化（NUMA-aware、thread-local freelist）。
+    -   长时间基准测试，验证写入吞吐与读延迟。
+    -   CI/CD 集成，自动化测试与分析。
 
 ---
 
-## 构建与运行
+## 使用说明
+
+### 构建
 
 ```bash
+# 克隆仓库
+git clone https://github.com/yourname/sb_tree.git
+cd sb_tree
+
 # 配置与构建
 cmake -B build
 cmake --build build -j
-
-# 运行全部测试
-cd build
-ctest --output-on-failure
 ```
