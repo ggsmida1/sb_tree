@@ -1,6 +1,7 @@
 #include "SBTree.h"
 #include <vector>
 #include <iostream>
+#include <cassert>
 
 // ========================= 构造/析构 =========================
 SBTree::SBTree()
@@ -14,22 +15,26 @@ SBTree::SBTree()
     index_thread_ = std::thread(&SBTree::index_worker_, this);
 }
 
+// 修正后的析构函数，修复了死锁问题
 SBTree::~SBTree()
 {
-    // 1) 刷新活跃段，转换并落盘到数据层
+    // 1) 确保所有在活跃段中的数据都被推入任务队列
     flush();
-    // 2) 等待索引层同步完成
-    flush_index();
-    // 3) 通知后台线程退出
+
+    // 2) 设置停止标志并通知后台线程：“完成队列里所有剩余任务就退出”
     {
         std::lock_guard<std::mutex> lk(q_mu_);
         index_stop_.store(true, std::memory_order_release);
     }
-    q_cv_.notify_all();
-    if (index_thread_.joinable())
-        index_thread_.join();
+    q_cv_.notify_all(); // 唤醒可能正在等待的后台线程
 
-    // 4) 释放数据层链表
+    // 3) 等待后台线程处理完所有任务并安全退出
+    if (index_thread_.joinable())
+    {
+        index_thread_.join();
+    }
+
+    // 4) 此时后台线程已停止，可以安全地释放数据层链表
     DataBlock *cur = data_head_;
     while (cur)
     {
@@ -99,7 +104,6 @@ void SBTree::convert_and_append(SegmentedBlock *seg_to_convert)
         }
         max_key_ = std::max<Key>(max_key_, sorted_data.back().key);
     }
-    std::cout << "Appended " << sorted_data.size() << " entries to the data layer.\n";
     enqueue_index_task_(std::move(new_blocks));
 }
 
@@ -128,8 +132,14 @@ void SBTree::index_worker_()
             std::unique_lock<std::mutex> lk(q_mu_);
             q_cv_.wait(lk, [&]
                        { return index_stop_.load() || !index_q_.empty(); });
+            // 只有在被唤醒后，确定要停止且队列已空，才退出
             if (index_stop_.load() && index_q_.empty())
                 break;
+
+            // 如果队列不空，即使收到了停止信号也要继续处理完
+            if (index_q_.empty())
+                continue;
+
             batch = std::move(index_q_.front());
             index_q_.pop_front();
             ++index_in_flight_;
@@ -152,14 +162,6 @@ void SBTree::flush()
     SegmentedBlock *final_seg = shortcut_.exchange(nullptr);
     if (final_seg)
         convert_and_append(final_seg);
-}
-
-// 等待索引完成
-void SBTree::flush_index()
-{
-    std::unique_lock<std::mutex> lk(q_mu_);
-    q_cv_.wait(lk, [&]
-               { return index_q_.empty() && (index_in_flight_.load() == 0); });
 }
 
 // 插入（并发友好，支持段切换）
@@ -240,6 +242,7 @@ size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
 {
     if (l > r)
         return 0;
+    out.clear(); // 确保结果容器是空的
     auto cur = open_range_cursor(l, r);
     size_t added = 0;
     KVPair kv;
@@ -326,6 +329,7 @@ size_t SBTree::RangeCursor::next_batch(std::vector<KVPair> &out, size_t limit)
 {
     if (!blk_ || limit == 0)
         return 0;
+    out.clear();
     size_t added = 0;
     KVPair kv;
     while (added < limit && next(&kv))
@@ -379,12 +383,9 @@ DataBlock *SBTree::find_candidate_(Key k) const
 
 void SBTree::insert_delayed(Key k, Value v)
 {
-    // 如果数据层还没建好，退回 fast path（极早期）
     if (!data_head_)
     {
-        SegmentedBlock *seg = shortcut_.load();
-        if (seg)
-            seg->append_ordered(k, v);
+        insert(k, v); // 回退到常规插入
         return;
     }
 
@@ -393,14 +394,12 @@ void SBTree::insert_delayed(Key k, Value v)
     {
         std::lock_guard<std::mutex> g(data_layer_lock_);
 
-        // 在锁里复核 candidate（索引层可能滞后）
         DataBlock *blk = search_.find_candidate(k);
         if (!blk)
             blk = data_head_;
         while (blk->next() && blk->next()->min_key() <= k)
             blk = blk->next();
 
-        // 块内有序插入；满块则 split 并重链
         if (!blk->insert_sorted(k, v))
         {
             DataBlock *right = blk->split();
@@ -409,18 +408,16 @@ void SBTree::insert_delayed(Key k, Value v)
                 right->set_next(blk->next());
                 blk->set_next(right);
                 new_blocks.push_back(right);
-                // 依据 min_key 决定最终落入哪侧
                 (k >= right->min_key() ? right : blk)->insert_sorted(k, v);
             }
             else
             {
-                // 极端情况下（理论上不该发生），直接重试插入当前块
+                // 如果分裂失败（例如块内只有一个元素），直接尝试插入
                 blk->insert_sorted(k, v);
             }
         }
-    } // 锁释放
+    }
 
-    // 索引层入队放锁外，避免阻塞其他写入
     if (!new_blocks.empty())
         enqueue_index_task_(std::move(new_blocks));
 }

@@ -33,3 +33,6 @@ FetchContent_MakeAvailable(googletest)
 
 enable_testing()
 add_subdirectory(test)
+
+# 添加 benchmark 子目录 (这是新增的一行)
+add_subdirectory(benchmark)

@@ -125,3 +125,18 @@ SB-Tree 支持两种写入路径：
 
 ✅ **当前版本状态：稳定（全测试通过）**  
 支持顺序与延迟写入的高并发 SB-Tree 原型实现。
+
+
+cd ~/sb_tree
+
+rm -rf build
+
+
+mkdir build
+cd build
+
+cmake -DCMAKE_BUILD_TYPE=Release ..
+
+make sbtree_benchmark
+
+./benchmark/sbtree_benchmark
