@@ -6,7 +6,8 @@
 SBTree::SBTree()
     : shortcut_(new SegmentedBlock()),
       data_head_(nullptr),
-      data_tail_(nullptr)
+      data_tail_(nullptr),
+      max_key_(std::numeric_limits<Key>::lowest())
 {
     // 启动索引后台线程
     index_stop_.store(false, std::memory_order_relaxed);
@@ -37,10 +38,6 @@ SBTree::~SBTree()
         cur = nxt;
     }
     data_head_ = data_tail_ = nullptr;
-
-    // 5) 释放活跃分段块
-    delete shortcut_;
-    shortcut_ = nullptr;
 }
 
 // ========================= 内部辅助 =========================
@@ -100,6 +97,7 @@ void SBTree::convert_and_append(SegmentedBlock *seg_to_convert)
             data_tail_->set_next(new_chain_head);
             data_tail_ = new_chain_tail;
         }
+        max_key_ = std::max<Key>(max_key_, sorted_data.back().key);
     }
     std::cout << "Appended " << sorted_data.size() << " entries to the data layer.\n";
     enqueue_index_task_(std::move(new_blocks));
@@ -167,13 +165,18 @@ void SBTree::flush_index()
 // 插入（并发友好，支持段切换）
 void SBTree::insert(Key key, Value value)
 {
+    // 仅当数据层已经有内容，且 key 小于当前最大 key，才视为延迟
+    if (data_head_ && key <= max_key_)
+    {
+        insert_delayed(key, value);
+        return;
+    }
+
     for (;;)
     {
         SegmentedBlock *seg = shortcut_.load();
         if (seg && seg->append_ordered(key, value))
         {
-            if (key > max_key_)
-                max_key_ = key;
             if (seg->should_seal())
             {
                 auto *new_seg = new SegmentedBlock();
@@ -372,6 +375,54 @@ bool SBTree::verify_data_layer(size_t expected_total_keys) const
 DataBlock *SBTree::find_candidate_(Key k) const
 {
     return search_.find_candidate(k);
+}
+
+void SBTree::insert_delayed(Key k, Value v)
+{
+    // 如果数据层还没建好，退回 fast path（极早期）
+    if (!data_head_)
+    {
+        SegmentedBlock *seg = shortcut_.load();
+        if (seg)
+            seg->append_ordered(k, v);
+        return;
+    }
+
+    std::vector<DataBlock *> new_blocks; // 可能产生的新块（split）
+
+    {
+        std::lock_guard<std::mutex> g(data_layer_lock_);
+
+        // 在锁里复核 candidate（索引层可能滞后）
+        DataBlock *blk = search_.find_candidate(k);
+        if (!blk)
+            blk = data_head_;
+        while (blk->next() && blk->next()->min_key() <= k)
+            blk = blk->next();
+
+        // 块内有序插入；满块则 split 并重链
+        if (!blk->insert_sorted(k, v))
+        {
+            DataBlock *right = blk->split();
+            if (right)
+            {
+                right->set_next(blk->next());
+                blk->set_next(right);
+                new_blocks.push_back(right);
+                // 依据 min_key 决定最终落入哪侧
+                (k >= right->min_key() ? right : blk)->insert_sorted(k, v);
+            }
+            else
+            {
+                // 极端情况下（理论上不该发生），直接重试插入当前块
+                blk->insert_sorted(k, v);
+            }
+        }
+    } // 锁释放
+
+    // 索引层入队放锁外，避免阻塞其他写入
+    if (!new_blocks.empty())
+        enqueue_index_task_(std::move(new_blocks));
 }
 
 uint64_t SBTree::index_batches_enqueued() const noexcept { return idx_batches_enqueued_.load(); }

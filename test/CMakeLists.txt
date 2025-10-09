@@ -18,7 +18,8 @@ add_sbtest(test_autodetect_capacity_gtest test_autodetect_capacity_gtest.cpp)
 add_sbtest(test_concurrent_insert_gtest test_concurrent_insert_gtest.cpp)
 add_sbtest(test_rowex_levels_gtest test_rowex_levels_gtest.cpp)
 add_sbtest(test_rowex_concurrent_readwrite_gtest test_rowex_concurrent_readwrite_gtest.cpp)
-
+add_sbtest(InterleavedKeysAllThreadsSameRange InterleavedKeysAllThreadsSameRange.cpp)
+add_sbtest(test_insert_delayed_gtest test_insert_delayed_gtest.cpp)
 
 # 两个非-gtest 的可执行（保持原样）
 add_executable(test_single_insert test_single_insert.cpp)

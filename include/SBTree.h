@@ -35,6 +35,8 @@ public:
     bool lookup(Key k, Value *out) const;                     // 查找
     size_t scan(Key l, Key r, std::vector<Value> &out) const; // 范围扫描
 
+    void insert_delayed(Key k, Value v); // 延迟插入
+
     // ========================= 测试/诊断接口 =========================
     bool verify_data_layer(size_t expected_total_keys) const; // 遍历数据层验证正确性
     void flush();                                             // 刷新段 → 数据块（立即转换）

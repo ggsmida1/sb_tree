@@ -105,6 +105,78 @@ size_t DataBlock::scan_range(Key start, Key end, std::vector<Value> &out) const
     return taken;
 }
 
+bool DataBlock::insert_sorted(Key k, Value v)
+{
+    if (count_ >= kCapacity)
+        return false;
+
+    // lower_bound 查插入位置
+    uint32_t L = 0, R = count_;
+    while (L < R)
+    {
+        uint32_t mid = L + ((R - L) >> 1);
+        if (keys_[mid] < k)
+            L = mid + 1;
+        else
+            R = mid;
+    }
+    uint32_t pos = L;
+
+    // 相同 key 覆盖，不产生重复
+    if (pos < count_ && keys_[pos] == k)
+    {
+        vals_[pos] = v;
+        return true;
+    }
+
+    // 右移空出位置
+    for (uint32_t i = count_; i > pos; --i)
+    {
+        keys_[i] = keys_[i - 1];
+        vals_[i] = vals_[i - 1];
+    }
+    keys_[pos] = k;
+    vals_[pos] = v;
+    ++count_;
+
+    // 维护块最小 key
+    if (count_ == 1 || pos == 0)
+        min_key_ = k;
+
+    // 重建 N-ary 索引
+    build_nary_();
+    return true;
+}
+
+DataBlock *DataBlock::split()
+{
+    // 需要至少两个元素才有意义
+    if (count_ <= 1)
+        return nullptr;
+
+    uint32_t mid = count_ / 2;
+    DataBlock *right = new DataBlock();
+    uint32_t rsz = count_ - mid;
+
+    // 拷贝右半部分
+    for (uint32_t i = 0; i < rsz; ++i)
+    {
+        right->keys_[i] = keys_[mid + i];
+        right->vals_[i] = vals_[mid + i];
+    }
+    right->count_ = rsz;
+    right->min_key_ = right->keys_[0];
+
+    // 左半保留
+    count_ = mid;
+    min_key_ = keys_[0];
+
+    // 重建左右的 N-ary
+    build_nary_();
+    right->build_nary_();
+    return right;
+}
+
 // ========================= 内部辅助 =========================
 // 构建 N-ary 搜索表
 void DataBlock::build_nary_()

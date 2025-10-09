@@ -59,6 +59,9 @@ public:
     // 直接按索引读取键值（无边界检查；测试/校验用）。
     KVPair get_entry(size_t index) const { return {keys_[index], vals_[index]}; }
 
+    bool insert_sorted(Key k, Value v); // 在块内有序插入（假设 k 大于等于当前最大 key）
+    DataBlock *split();                 // 块满时分裂，返回新块指
+
 private:
     // ========================= 常量与布局（仅内部） =========================
     static constexpr size_t kBlockSize = 4096; // 整块大小：4KB
