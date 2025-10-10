@@ -32,4 +32,7 @@ set(gtest_force_shared_crt OFF CACHE BOOL "Use shared CRT" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
+
 add_subdirectory(test)
+add_subdirectory(bench)
+# add_subdirectory(benchmark)
