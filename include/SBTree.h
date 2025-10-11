@@ -90,7 +90,7 @@ private:
     std::atomic<uint64_t> idx_items_applied_{0};
 
     // ========================= 数据层 =========================
-    Key max_key_{0};
+    std::atomic<Key> max_key_{0};
     std::atomic<SegmentedBlock *> shortcut_; // 当前活跃分段块
     mutable std::mutex data_layer_lock_;     // 数据层链表锁
     DataBlock *data_head_;                   // 数据链表头

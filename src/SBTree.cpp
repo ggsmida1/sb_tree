@@ -39,7 +39,7 @@ SBTree::~SBTree()
     data_head_ = data_tail_ = nullptr;
 
     // 5) 释放活跃分段块
-    delete shortcut_;
+    delete shortcut_.load();
     shortcut_ = nullptr;
 }
 
@@ -172,8 +172,14 @@ void SBTree::insert(Key key, Value value)
         SegmentedBlock *seg = shortcut_.load();
         if (seg && seg->append_ordered(key, value))
         {
-            if (key > max_key_)
-                max_key_ = key;
+            Key current_max = max_key_.load(std::memory_order_relaxed);
+            while (key > current_max)
+            {
+                if (max_key_.compare_exchange_weak(current_max, key, std::memory_order_relaxed))
+                {
+                    break;
+                }
+            }
             if (seg->should_seal())
             {
                 auto *new_seg = new SegmentedBlock();
