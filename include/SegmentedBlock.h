@@ -83,8 +83,8 @@ private:
     std::atomic<size_t> committed_count_; // 已提交的 PTB 槽位数（确认可用）
 
     // ========================= PTB 指针表 =========================
-    static constexpr size_t kMaxPTBs = 128;      // 最多支持的线程/槽位数
-    PerThreadDataBlock *ptb_pointers_[kMaxPTBs]; // 每线程数据块指针表（按槽位索引）
+    static constexpr size_t kMaxPTBs = 128;                    // 最多支持的线程/槽位数
+    std::atomic<PerThreadDataBlock *> ptb_pointers_[kMaxPTBs]; // 每线程数据块指针表（按槽位索引）
 
     // ========================= 封印触发标志 =========================
     // 由“写满”的那次 append_ordered 置位；上层可据此触发切段。
