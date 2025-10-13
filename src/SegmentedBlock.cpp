@@ -193,3 +193,18 @@ int SegmentedBlock::get_or_create_slot_for_this_thread_()
     tls_cache.slot = static_cast<int>(slot_idx);
     return tls_cache.slot;
 }
+
+bool SegmentedBlock::is_completely_empty() const noexcept
+{
+    for (size_t i = 0; i < kMaxPTBs; ++i)
+    {
+        // 指针用 acquire 读取，保证看到 PTB 构造后的状态
+        PerThreadDataBlock *ptb =
+            ptb_pointers_[i].load(std::memory_order_acquire);
+        if (ptb && ptb->GetNumEntries() > 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}

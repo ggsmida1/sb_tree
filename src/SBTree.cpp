@@ -15,16 +15,18 @@ SBTree::SBTree()
 
 SBTree::~SBTree()
 {
-    // 1) 刷新活跃段，转换并落盘到数据层
-    flush();
-    // 2) 等待索引层同步完成
-    flush_index();
-    // 3) 通知后台线程退出
+    // 1. 先停后台线程
     {
         std::lock_guard<std::mutex> lk(q_mu_);
         index_stop_.store(true, std::memory_order_release);
     }
     q_cv_.notify_all();
+
+    // 2. 等待任务完成
+    flush();
+    flush_index();
+
+    // 3. 等待线程退出
     if (index_thread_.joinable())
         index_thread_.join();
 
@@ -44,174 +46,263 @@ SBTree::~SBTree()
 }
 
 // ========================= 内部辅助 =========================
-// 段转换 + 追加到数据层 + 入队索引任务
-void SBTree::convert_and_append(SegmentedBlock *seg_to_convert)
-{
-    if (!seg_to_convert)
-        return;
-    std::vector<KVPair> sorted_data = seg_to_convert->collect_and_sort_data();
-    delete seg_to_convert;
-    if (sorted_data.empty())
-        return;
-
-    DataBlock *new_chain_head = nullptr;
-    DataBlock *new_chain_tail = nullptr;
-    std::vector<DataBlock *> new_blocks;
-    new_blocks.reserve(16);
-
-    const KVPair *current_pos = sorted_data.data();
-    size_t remaining = sorted_data.size();
-    bool first_block = true;
-    Key prev_min = 0;
-
-    while (remaining > 0)
-    {
-        DataBlock *new_block = new DataBlock();
-        size_t consumed = new_block->build_from_sorted(current_pos, remaining);
-        assert(consumed > 0);
-
-        if (!new_chain_head)
-            new_chain_head = new_chain_tail = new_block;
-        else
-        {
-            new_chain_tail->set_next(new_block);
-            new_chain_tail = new_block;
-        }
-
-        if (!first_block)
-            assert(prev_min <= new_block->min_key());
-        prev_min = new_block->min_key();
-        first_block = false;
-        new_blocks.push_back(new_block);
-
-        current_pos += consumed;
-        remaining -= consumed;
-    }
-
-    {
-        std::lock_guard<std::mutex> g(data_layer_lock_);
-        if (!data_tail_)
-        {
-            data_head_ = new_chain_head;
-            data_tail_ = new_chain_tail;
-        }
-        else
-        {
-            data_tail_->set_next(new_chain_head);
-            data_tail_ = new_chain_tail;
-        }
-    }
-    std::cout << "Appended " << sorted_data.size() << " entries to the data layer.\n";
-    enqueue_index_task_(std::move(new_blocks));
-}
-
-// 入队索引任务
-void SBTree::enqueue_index_task_(std::vector<DataBlock *> &&blocks)
-{
-    if (blocks.empty())
-        return;
-    idx_batches_enqueued_.fetch_add(1);
-    idx_items_enqueued_.fetch_add(blocks.size());
-
-    {
-        std::lock_guard<std::mutex> lk(q_mu_);
-        index_q_.emplace_back(std::move(blocks));
-    }
-    q_cv_.notify_one();
-}
 
 // 后台索引线程主循环
 void SBTree::index_worker_()
 {
     for (;;)
     {
-        std::vector<DataBlock *> batch;
+        SegmentedBlock *seg_to_convert = nullptr;
         {
             std::unique_lock<std::mutex> lk(q_mu_);
             q_cv_.wait(lk, [&]
-                       { return index_stop_.load() || !index_q_.empty(); });
-            if (index_stop_.load() && index_q_.empty())
+                       { return index_stop_.load() || !segments_to_convert_q_.empty(); });
+
+            if (index_stop_.load() && segments_to_convert_q_.empty())
                 break;
-            batch = std::move(index_q_.front());
-            index_q_.pop_front();
+
+            seg_to_convert = segments_to_convert_q_.front();
+            segments_to_convert_q_.pop_front();
             ++index_in_flight_;
         }
+
+        fprintf(stderr, "[worker] start convert seg %p\n", (void *)seg_to_convert);
+        // =================================================================
+        //  ↓↓↓ 这里是原 convert_and_append 的逻辑 ↓↓↓
+        // =================================================================
+
+        // 1. 收集和排序数据
+        std::vector<KVPair> sorted_data = seg_to_convert->collect_and_sort_data();
+        fprintf(stderr, "[worker] seg %p collect size=%zu\n",
+                (void *)seg_to_convert, sorted_data.size());
+        delete seg_to_convert;
+        if (sorted_data.empty())
+        {
+            --index_in_flight_;
+            q_cv_.notify_all();
+            continue;
+        }
+
+        // 2. 切片成 DataBlocks
+        std::vector<DataBlock *> new_blocks;
+        DataBlock *new_chain_head = nullptr;
+        DataBlock *new_chain_tail = nullptr;
+
+        const KVPair *current_pos = sorted_data.data();
+        size_t remaining = sorted_data.size();
+        while (remaining > 0)
+        {
+            auto *new_block = new DataBlock();
+            size_t consumed = new_block->build_from_sorted(current_pos, remaining);
+            assert(consumed > 0);
+
+            if (!new_chain_head)
+            {
+                new_chain_head = new_chain_tail = new_block;
+            }
+            else
+            {
+                new_chain_tail->set_next(new_block);
+                new_chain_tail = new_block;
+            }
+            new_blocks.push_back(new_block);
+            current_pos += consumed;
+            remaining -= consumed;
+        }
+
+        // 3. 追加到主数据层链表
+        {
+            std::lock_guard<std::mutex> g(data_layer_lock_);
+            if (!data_tail_)
+            {
+                data_head_ = new_chain_head;
+                data_tail_ = new_chain_tail;
+            }
+            else
+            {
+                data_tail_->set_next(new_chain_head);
+                data_tail_ = new_chain_tail;
+            }
+        }
+
+        // 4. 应用到搜索层 (这是原 enqueue_index_task_ 的最终目的)
         {
             std::unique_lock<std::shared_mutex> wlock(search_mu_);
-            search_.append_run(batch);
+            search_.append_run(new_blocks);
         }
-        idx_batches_applied_.fetch_add(1);
-        idx_items_applied_.fetch_add(batch.size());
-        --index_in_flight_;
-        q_cv_.notify_all();
+
+        // =================================================================
+        //  ↑↑↑ 原 convert_and_append 的逻辑结束 ↑↑↑
+        // =================================================================
+
+        // 【关键修复】统一的、唯一的任务完成通知点
+        {
+            std::lock_guard<std::mutex> lk(q_mu_);
+
+            // 更新统计数据
+            idx_batches_applied_.fetch_add(1);
+            if (!sorted_data.empty())
+            {
+                // 如果您保存了 size，就可以在这里用
+                // idx_items_applied_.fetch_add(num_new_blocks);
+                // 或者直接用 sorted_data 的 size 作为近似值，这取决于您的统计需求
+                idx_items_applied_.fetch_add(sorted_data.size());
+            }
+
+            --index_in_flight_;
+            q_cv_.notify_all();
+        }
     }
 }
-
 // ========================= 基本操作 =========================
 // 刷新活跃段
 void SBTree::flush()
 {
     SegmentedBlock *final_seg = shortcut_.exchange(nullptr);
-    if (final_seg)
-        convert_and_append(final_seg);
+    if (!final_seg)
+    {
+        fprintf(stderr, "[flush] no active segment (shortcut_ already null)\n");
+        return;
+    }
+
+    bool empty = final_seg->is_completely_empty(); // 如果你还没实现，就暂时假设 false
+    fprintf(stderr, "[flush] sealing segment %p (empty=%d)\n", (void *)final_seg, empty);
+
+    if (empty)
+    {
+        delete final_seg;
+        return;
+    }
+
+    final_seg->seal();
+    {
+        std::lock_guard<std::mutex> lk(q_mu_);
+        segments_to_convert_q_.push_back(final_seg);
+        idx_batches_enqueued_.fetch_add(1, std::memory_order_relaxed);
+        fprintf(stderr, "[flush] enqueued segment %p, queue_size=%zu\n",
+                (void *)final_seg, segments_to_convert_q_.size());
+    }
+    q_cv_.notify_one();
 }
 
 // 等待索引完成
 void SBTree::flush_index()
 {
+    fprintf(stderr, "[flush_index] waiting for background queue to drain...\n");
     std::unique_lock<std::mutex> lk(q_mu_);
     q_cv_.wait(lk, [&]
-               { return index_q_.empty() && (index_in_flight_.load() == 0); });
+               {
+        bool done = segments_to_convert_q_.empty() &&
+                    (index_in_flight_.load() == 0);
+        if (!done) {
+            fprintf(stderr, "[flush_index] still pending: queue=%zu, in_flight=%d\n",
+                    segments_to_convert_q_.size(),
+                    (int)index_in_flight_.load());
+        }
+        return done; });
+    fprintf(stderr, "[flush_index] all segments converted.\n");
 }
 
 // 插入（并发友好，支持段切换）
 void SBTree::insert(Key key, Value value)
 {
-    for (;;)
+    for (;;) // 这个重试循环处理所有竞争情况
     {
-        SegmentedBlock *seg = shortcut_.load();
-        if (seg && seg->append_ordered(key, value))
+        SegmentedBlock *seg = shortcut_.load(std::memory_order_acquire);
+
+        // --- (1) 若当前活跃段为空，执行自举安装 ---
+        if (seg == nullptr)
         {
+            fprintf(stderr, "[insert] shortcut is null\n");
+
+            // 尝试创建新的活跃段（bootstrap）
+            auto *new_seg = new SegmentedBlock();
+            SegmentedBlock *expected = nullptr;
+
+            // CAS 尝试安装新段（只有一个线程能成功）
+            if (shortcut_.compare_exchange_strong(expected, new_seg,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed))
+            {
+                // 我们成功安装了新段，下一轮循环即可正常插入
+                continue;
+            }
+            else
+            {
+                // 有其他线程抢先安装了段，丢弃我们刚创建的
+                delete new_seg;
+                // 下一轮循环使用别人安装的段
+                continue;
+            }
+        }
+
+        // --- (2) 正常插入路径 ---
+        if (seg->append_ordered(key, value))
+        {
+            // 键已成功插入当前段。
+
+            // 原子性地更新 max_key
             Key current_max = max_key_.load(std::memory_order_relaxed);
             while (key > current_max)
             {
                 if (max_key_.compare_exchange_weak(current_max, key, std::memory_order_relaxed))
-                {
                     break;
-                }
             }
+
+            // 检查是否需要切段
             if (seg->should_seal())
             {
+                // 本次插入刚好填满了段。
                 auto *new_seg = new SegmentedBlock();
                 SegmentedBlock *expected = seg;
-                if (shortcut_.compare_exchange_strong(expected, new_seg))
+
+                if (shortcut_.compare_exchange_strong(expected, new_seg,
+                                                      std::memory_order_release,
+                                                      std::memory_order_relaxed))
                 {
+                    // CAS 成功：当前线程负责封段 + 入队
                     seg->seal();
-                    convert_and_append(seg);
+                    {
+                        std::lock_guard<std::mutex> lk(q_mu_);
+                        segments_to_convert_q_.push_back(seg);
+                        idx_batches_enqueued_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    q_cv_.notify_one();
                 }
                 else
                 {
+                    // CAS 失败：别人已经替换了，我们只需清理
                     delete new_seg;
                 }
             }
-            return;
+            return; // 插入成功
         }
-        auto *new_seg = new SegmentedBlock();
-        SegmentedBlock *expected = seg;
-        if (shortcut_.compare_exchange_strong(expected, new_seg))
+
+        // --- (3) 失败/重试路径 ---
+        // append_ordered 失败或段被封印，尝试切换新段
+        SegmentedBlock *current_seg_on_failure = shortcut_.load(std::memory_order_acquire);
+        if (current_seg_on_failure) // 仅当确实有旧段需要替换时才尝试
         {
-            if (seg)
+            auto *new_seg = new SegmentedBlock();
+            SegmentedBlock *expected = current_seg_on_failure;
+
+            if (shortcut_.compare_exchange_strong(expected, new_seg,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed))
             {
-                seg->seal();
-                convert_and_append(seg);
+                current_seg_on_failure->seal();
+                {
+                    std::lock_guard<std::mutex> lk(q_mu_);
+                    segments_to_convert_q_.push_back(current_seg_on_failure);
+                }
+                q_cv_.notify_one();
             }
-            new_seg->append_ordered(key, value);
-            return;
+            else
+            {
+                delete new_seg; // 别的线程赢了
+            }
         }
-        else
-        {
-            delete new_seg;
-        }
+        // 循环重试
     }
 }
 

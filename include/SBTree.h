@@ -69,19 +69,17 @@ public:
 
 private:
     // ========================= 内部辅助 =========================
-    void convert_and_append(SegmentedBlock *seg_to_convert);     // 段转换 + 追加数据块
     void index_worker_();                                        // 后台索引线程主循环
-    void enqueue_index_task_(std::vector<DataBlock *> &&blocks); // 入队索引任务
     DataBlock *find_candidate_(Key k) const;                     // 在搜索层中查找候选块
 
     // ========================= 并发控制 =========================
-    mutable std::shared_mutex search_mu_;          // 搜索层读写锁
-    std::thread index_thread_;                     // 专用索引维护线程
-    std::deque<std::vector<DataBlock *>> index_q_; // 索引任务队列
-    std::mutex q_mu_;                              // 队列锁
-    std::condition_variable q_cv_;                 // 队列条件变量
-    std::atomic<bool> index_stop_{false};          // 线程停止标志
-    std::atomic<size_t> index_in_flight_{0};       // 正在处理中的批次数
+    mutable std::shared_mutex search_mu_;                // 搜索层读写锁
+    std::thread index_thread_;                           // 专用索引维护线程
+    std::deque<SegmentedBlock *> segments_to_convert_q_; // 索引任务队列
+    std::mutex q_mu_;                                    // 队列锁
+    std::condition_variable q_cv_;                       // 队列条件变量
+    std::atomic<bool> index_stop_{false};                // 线程停止标志
+    std::atomic<size_t> index_in_flight_{0};             // 正在处理中的批次数
 
     // ========================= 统计指标 =========================
     std::atomic<uint64_t> idx_batches_enqueued_{0};

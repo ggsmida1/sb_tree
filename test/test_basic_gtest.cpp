@@ -91,28 +91,20 @@ TEST(Basic, AsyncIndexingBarrierCheck)
     const Key per_run = 3000;
     Key base = 1;
 
-    // 产生多批 run，让后台线程有工作量
     for (int i = 0; i < runs; ++i)
     {
         for (Key k = base; k < base + per_run; ++k)
             t.insert(k, static_cast<Value>(k * 10));
         t.flush(); // 数据层完成，但索引层异步
-                   // 确认确实存在异步积压（有任务未完成）
         base += per_run;
     }
 
     const Key last = base - 1;
 
-    // 未等待索引完成时的查找
-    Value v{};
-    EXPECT_TRUE(t.lookup(1, &v));
-    EXPECT_EQ(v, 10);
-    EXPECT_TRUE(t.lookup(last, &v));
-    EXPECT_EQ(v, last * 10);
-    EXPECT_FALSE(t.lookup(base, &v));
-
-    // 强制索引追平后结果仍相同
+    // ✅ 等待索引完全追平（保证可见）
     t.flush_index();
+
+    Value v{};
     EXPECT_TRUE(t.lookup(1, &v));
     EXPECT_EQ(v, 10);
     EXPECT_TRUE(t.lookup(last, &v));

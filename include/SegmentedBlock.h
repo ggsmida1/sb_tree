@@ -67,6 +67,8 @@ public:
     // 若返回 true，表示需要封印（由“写满”的那次写入置位，上层据此触发切段）。
     bool should_seal() const noexcept { return should_seal_.load(std::memory_order_acquire); }
 
+    bool is_completely_empty() const noexcept;
+
 private:
     // ========================= 内部辅助 =========================
     // 为“当前线程”分配一个专属 PTB 槽位（第一次调用时分配）。
