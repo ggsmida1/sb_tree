@@ -4,6 +4,7 @@
 DataBlock::DataBlock()
     : status_(Status::READY),
       min_key_(std::numeric_limits<Key>::max()),
+      max_key_(0),
       next_(nullptr),
       lock_(0),
       count_(0)
@@ -25,8 +26,17 @@ size_t DataBlock::build_from_sorted(const KVPair *src, size_t n)
         vals_[i] = src[i].value;
     }
     count_ = static_cast<uint32_t>(take);
+
     if (take > 0)
+    {
         min_key_ = keys_[0];
+        // 【修改】在构建时，同时设置 max_key_
+        // 因为数据是排序的，所以最后一个元素的 key 就是最大 key
+        max_key_ = keys_[take - 1];
+    }
+    // 【注意】如果 take == 0 (块为空)，min_key_ 和 max_key_ 会保留
+    // 构造函数中的初始值，这是正确的行为。
+
     build_nary_();
     return take; // 如果 n > kCapacity，需要调用方继续切块
 }

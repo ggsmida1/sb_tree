@@ -52,6 +52,7 @@ public:
     // --- 访问器与链表链接 ---
     size_t size() const { return count_; }     // 当前条目数
     Key min_key() const { return min_key_; }   // 本块最小 key
+    Key max_key() const { return max_key_; }   // 本块最大 key
     DataBlock *next() const { return next_; }  // 后继数据块
     void set_next(DataBlock *p) { next_ = p; } // 设置后继数据块
 
@@ -91,6 +92,7 @@ private:
     // ========================= 元数据字段 =========================
     Status status_ = Status::READY;                 // 块状态（预留）
     Key min_key_ = std::numeric_limits<Key>::max(); // 块内最小 key
+    Key max_key_ = 0;                               // 块内最大 key
     DataBlock *next_ = nullptr;                     // 指向后继 DataBlock
     LockWord lock_ = 0;                             // 轻量锁（预留）
     uint32_t count_ = 0;                            // 实际填充条目数

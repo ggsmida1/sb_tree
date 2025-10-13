@@ -66,15 +66,7 @@ void SBTree::index_worker_()
             ++index_in_flight_;
         }
 
-        fprintf(stderr, "[worker] start convert seg %p\n", (void *)seg_to_convert);
-        // =================================================================
-        //  ↓↓↓ 这里是原 convert_and_append 的逻辑 ↓↓↓
-        // =================================================================
-
-        // 1. 收集和排序数据
         std::vector<KVPair> sorted_data = seg_to_convert->collect_and_sort_data();
-        fprintf(stderr, "[worker] seg %p collect size=%zu\n",
-                (void *)seg_to_convert, sorted_data.size());
         delete seg_to_convert;
         if (sorted_data.empty())
         {
@@ -83,11 +75,9 @@ void SBTree::index_worker_()
             continue;
         }
 
-        // 2. 切片成 DataBlocks
         std::vector<DataBlock *> new_blocks;
         DataBlock *new_chain_head = nullptr;
         DataBlock *new_chain_tail = nullptr;
-
         const KVPair *current_pos = sorted_data.data();
         size_t remaining = sorted_data.size();
         while (remaining > 0)
@@ -97,9 +87,7 @@ void SBTree::index_worker_()
             assert(consumed > 0);
 
             if (!new_chain_head)
-            {
                 new_chain_head = new_chain_tail = new_block;
-            }
             else
             {
                 new_chain_tail->set_next(new_block);
@@ -113,6 +101,16 @@ void SBTree::index_worker_()
         // 3. 追加到主数据层链表
         {
             std::lock_guard<std::mutex> g(data_layer_lock_);
+
+            if (data_tail_ != nullptr && !new_blocks.empty())
+            {
+                Key old_max = data_tail_->max_key();
+                Key new_min = new_blocks.front()->min_key();
+                // fprintf(stderr, "[ASSERT_CHECK] old_max_key=%llu, new_min_key=%llu\n",
+                //         (unsigned long long)old_max, (unsigned long long)new_min);
+                assert(new_min > old_max && "FATAL INVARIANT VIOLATION: Key ranges overlap!");
+            }
+
             if (!data_tail_)
             {
                 data_head_ = new_chain_head;
@@ -125,30 +123,19 @@ void SBTree::index_worker_()
             }
         }
 
-        // 4. 应用到搜索层 (这是原 enqueue_index_task_ 的最终目的)
+        // 4. 应用到搜索层
         {
             std::unique_lock<std::shared_mutex> wlock(search_mu_);
             search_.append_run(new_blocks);
         }
 
-        // =================================================================
-        //  ↑↑↑ 原 convert_and_append 的逻辑结束 ↑↑↑
-        // =================================================================
-
-        // 【关键修复】统一的、唯一的任务完成通知点
         {
             std::lock_guard<std::mutex> lk(q_mu_);
-
-            // 更新统计数据
             idx_batches_applied_.fetch_add(1);
             if (!sorted_data.empty())
             {
-                // 如果您保存了 size，就可以在这里用
-                // idx_items_applied_.fetch_add(num_new_blocks);
-                // 或者直接用 sorted_data 的 size 作为近似值，这取决于您的统计需求
                 idx_items_applied_.fetch_add(sorted_data.size());
             }
-
             --index_in_flight_;
             q_cv_.notify_all();
         }
@@ -161,12 +148,12 @@ void SBTree::flush()
     SegmentedBlock *final_seg = shortcut_.exchange(nullptr);
     if (!final_seg)
     {
-        fprintf(stderr, "[flush] no active segment (shortcut_ already null)\n");
+        // fprintf(stderr, "[flush] no active segment (shortcut_ already null)\n");
         return;
     }
 
     bool empty = final_seg->is_completely_empty(); // 如果你还没实现，就暂时假设 false
-    fprintf(stderr, "[flush] sealing segment %p (empty=%d)\n", (void *)final_seg, empty);
+    // fprintf(stderr, "[flush] sealing segment %p (empty=%d)\n", (void *)final_seg, empty);
 
     if (empty)
     {
@@ -179,8 +166,8 @@ void SBTree::flush()
         std::lock_guard<std::mutex> lk(q_mu_);
         segments_to_convert_q_.push_back(final_seg);
         idx_batches_enqueued_.fetch_add(1, std::memory_order_relaxed);
-        fprintf(stderr, "[flush] enqueued segment %p, queue_size=%zu\n",
-                (void *)final_seg, segments_to_convert_q_.size());
+        // fprintf(stderr, "[flush] enqueued segment %p, queue_size=%zu\n",
+        //         (void *)final_seg, segments_to_convert_q_.size());
     }
     q_cv_.notify_one();
 }
@@ -188,19 +175,19 @@ void SBTree::flush()
 // 等待索引完成
 void SBTree::flush_index()
 {
-    fprintf(stderr, "[flush_index] waiting for background queue to drain...\n");
+    // fprintf(stderr, "[flush_index] waiting for background queue to drain...\n");
     std::unique_lock<std::mutex> lk(q_mu_);
     q_cv_.wait(lk, [&]
                {
         bool done = segments_to_convert_q_.empty() &&
                     (index_in_flight_.load() == 0);
-        if (!done) {
-            fprintf(stderr, "[flush_index] still pending: queue=%zu, in_flight=%d\n",
-                    segments_to_convert_q_.size(),
-                    (int)index_in_flight_.load());
-        }
+        // if (!done) {
+        //     fprintf(stderr, "[flush_index] still pending: queue=%zu, in_flight=%d\n",
+        //             segments_to_convert_q_.size(),
+        //             (int)index_in_flight_.load());
+        // }
         return done; });
-    fprintf(stderr, "[flush_index] all segments converted.\n");
+    // fprintf(stderr, "[flush_index] all segments converted.\n");
 }
 
 // 插入（并发友好，支持段切换）
@@ -213,7 +200,7 @@ void SBTree::insert(Key key, Value value)
         // --- (1) 若当前活跃段为空，执行自举安装 ---
         if (seg == nullptr)
         {
-            fprintf(stderr, "[insert] shortcut is null\n");
+            // fprintf(stderr, "[insert] shortcut is null\n");
 
             // 尝试创建新的活跃段（bootstrap）
             auto *new_seg = new SegmentedBlock();
