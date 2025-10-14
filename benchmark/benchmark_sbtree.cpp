@@ -21,7 +21,6 @@ static std::vector<uint64_t> generate_keys(size_t count, bool shuffle = false)
   if (shuffle)
   {
     std::random_device rd;
-    // **【关键修正】**：修复拼写错误，mt19937 是正确的名称
     std::mt19937 g(rd());
     std::shuffle(keys.begin(), keys.end(), g);
   }
@@ -29,7 +28,7 @@ static std::vector<uint64_t> generate_keys(size_t count, bool shuffle = false)
 }
 
 // =================================================================
-// 插入性能测试 (Insert Performance)
+// 插入性能测试
 // =================================================================
 
 // 测试顺序插入 (Fast Path) - 单线程
@@ -53,70 +52,74 @@ static void BM_SBTree_Sequential_Insert(benchmark::State &state)
 BENCHMARK(BM_SBTree_Sequential_Insert)->Range(1 << 12, 1 << 16);
 
 // =================================================================
-// 查询与扫描性能测试 (预填充数据)
+// 查询与扫描性能测试的 Fixture
 // =================================================================
-// 使用一个结构体来管理只初始化一次的共享资源（树和数据）
-struct QueryBenchmarkState
+class QueryScanFixture : public benchmark::Fixture
 {
+public:
   SBTree tree;
   std::vector<uint64_t> keys_to_lookup;
-  bool initialized = false;
 
-  QueryBenchmarkState(size_t num_keys)
+  void SetUp(const benchmark::State &state) override
   {
-    if (!initialized)
+    const size_t num_keys = state.range(0);
+
+    keys_to_lookup.clear();
+
+    // 填充树
+    auto keys_to_insert = generate_keys(num_keys, false);
+    for (const auto &key : keys_to_insert)
     {
-      auto keys_to_insert = generate_keys(num_keys, false);
-      for (const auto &key : keys_to_insert)
-      {
-        tree.insert(key, key * 10);
-      }
-      tree.flush();
-      tree.flush_index();
-      keys_to_lookup = generate_keys(num_keys, true); // 用于查找的键是随机的
-      initialized = true;
+      tree.insert(key, key * 10);
     }
+    // 确保所有数据都已从 SegmentedBlock 转换并进入 DataBlock
+    tree.flush();
+    // 确保索引已完全建立
+    tree.flush_index();
+
+    // 准备用于查找的随机键
+    keys_to_lookup = generate_keys(num_keys, true);
+  }
+
+  void TearDown(const benchmark::State &state) override
+  {
   }
 };
 
-// 点查询 (Lookup)
-static void BM_SBTree_Lookup(benchmark::State &state)
+// =================================================================
+// 使用 Fixture 进行点查询 (Lookup)
+// =================================================================
+BENCHMARK_F(QueryScanFixture, BM_SBTree_Lookup)(benchmark::State &state)
 {
-  state.PauseTiming();
-  auto num_keys = state.range(0);
-  static QueryBenchmarkState benchmark_state(num_keys);
-  auto &tree = benchmark_state.tree;
-  auto &keys_to_lookup = benchmark_state.keys_to_lookup;
-  state.ResumeTiming();
-
   for (auto _ : state)
   {
     // 每次循环随机查一部分key，避免缓存效应过于理想化
-    for (size_t i = 0; i < 1000; ++i)
+    for (size_t i = 0; i < 1000 && i < keys_to_lookup.size(); ++i)
     {
       uint64_t value;
-      benchmark::DoNotOptimize(tree.lookup(keys_to_lookup[i], &value));
+      bool found = tree.lookup(keys_to_lookup[i], &value);
+      benchmark::DoNotOptimize(found);
+      benchmark::DoNotOptimize(value);
     }
   }
   state.SetItemsProcessed(state.iterations() * 1000);
 }
-BENCHMARK(BM_SBTree_Lookup)->Range(1 << 16, 1 << 20);
+// 【MVP 修正】将测试起点从 1<<16 (65,536) 降低到 1<<12 (4,096)，上限暂时降到 1<<16
+BENCHMARK_REGISTER_F(QueryScanFixture, BM_SBTree_Lookup)->Range(1 << 12, 1 << 16);
 
-// 范围扫描 (Scan)
-static void BM_SBTree_Scan(benchmark::State &state)
+// =================================================================
+// 使用 Fixture 进行范围扫描 (Scan)
+// =================================================================
+BENCHMARK_F(QueryScanFixture, BM_SBTree_Scan)(benchmark::State &state)
 {
-  state.PauseTiming();
   auto num_keys = state.range(0);
   auto scan_size = state.range(1);
-  static QueryBenchmarkState benchmark_state(num_keys);
-  auto &tree = benchmark_state.tree;
 
   std::vector<uint64_t> result;
   result.reserve(scan_size);
 
   std::mt19937 rng(123); // 使用固定种子以保证可重复性
   std::uniform_int_distribution<uint64_t> dist(0, num_keys - scan_size);
-  state.ResumeTiming();
 
   for (auto _ : state)
   {
@@ -127,40 +130,34 @@ static void BM_SBTree_Scan(benchmark::State &state)
   }
   state.SetItemsProcessed(state.iterations());
 }
-BENCHMARK(BM_SBTree_Scan)->ArgsProduct({
-    {1 << 16, 1 << 20}, // 树的总大小
+// 【MVP 修正】将树的总大小测试范围的起点也降低到 1<<12
+BENCHMARK_REGISTER_F(QueryScanFixture, BM_SBTree_Scan)->ArgsProduct({
+    {1 << 12, 1 << 16}, // 树的总大小
     {100, 1000}         // 扫描范围大小
 });
 
 // =================================================================
-// 并发性能测试 (Concurrent Performance) - 【已修正】
+// 并发性能测试
 // =================================================================
-// 多线程并发插入
 static void BM_SBTree_Concurrent_Insert(benchmark::State &state)
 {
   auto num_keys_total = state.range(0);
 
-  // 外层循环是 benchmark 的多次重复测量
   for (auto _ : state)
   {
     state.PauseTiming();
-    // **【关键修正 1】**：为每次测量创建一个全新的、干净的树实例。
-    // 这确保了每次运行都测量的是从空树插入相同数量key的性能，保证了测试的公平性和可重复性。
     SBTree tree;
     auto num_threads = state.threads();
     const size_t keys_per_thread = num_keys_total / num_threads;
     std::vector<std::thread> threads;
     state.ResumeTiming();
 
-    // 创建并运行所有工作线程
     for (int tid = 0; tid < num_threads; ++tid)
     {
       threads.emplace_back([&, tid]()
                            {
                 for (size_t i = 0; i < keys_per_thread; ++i)
                 {
-                    // **【关键修正 2】**：使用交错键(interleaved key)模式。
-                    // 这比分区模式更能模拟真实负载，能对 SegmentedBlock 的切换和合并逻辑产生更大压力。
                     uint64_t key = (i * num_threads) + tid;
                     tree.insert(key, key * 10);
                 } });
@@ -173,9 +170,9 @@ static void BM_SBTree_Concurrent_Insert(benchmark::State &state)
   state.SetItemsProcessed(state.iterations() * num_keys_total);
 }
 BENCHMARK(BM_SBTree_Concurrent_Insert)
-    ->Arg(1 << 18)                                                // 每个 benchmark run 插入的总 key 数量
-    ->DenseThreadRange(1, std::thread::hardware_concurrency(), 2) // 测试 1, 3, 5... 个线程
-    ->UseRealTime();                                              // 对于多线程测试，使用真实墙上时间
+    ->Arg(1 << 18)
+    ->DenseThreadRange(1, std::thread::hardware_concurrency(), 2)
+    ->UseRealTime();
 
 // 运行 benchmark
 BENCHMARK_MAIN();
