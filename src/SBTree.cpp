@@ -131,11 +131,6 @@ void SBTree::index_worker_()
 
         {
             std::lock_guard<std::mutex> lk(q_mu_);
-            idx_batches_applied_.fetch_add(1);
-            if (!sorted_data.empty())
-            {
-                idx_items_applied_.fetch_add(sorted_data.size());
-            }
             --index_in_flight_;
             q_cv_.notify_all();
         }
@@ -148,12 +143,10 @@ void SBTree::flush()
     SegmentedBlock *final_seg = shortcut_.exchange(nullptr);
     if (!final_seg)
     {
-        // fprintf(stderr, "[flush] no active segment (shortcut_ already null)\n");
         return;
     }
 
     bool empty = final_seg->is_completely_empty(); // 如果你还没实现，就暂时假设 false
-    // fprintf(stderr, "[flush] sealing segment %p (empty=%d)\n", (void *)final_seg, empty);
 
     if (empty)
     {
@@ -165,9 +158,6 @@ void SBTree::flush()
     {
         std::lock_guard<std::mutex> lk(q_mu_);
         segments_to_convert_q_.push_back(final_seg);
-        idx_batches_enqueued_.fetch_add(1, std::memory_order_relaxed);
-        // fprintf(stderr, "[flush] enqueued segment %p, queue_size=%zu\n",
-        //         (void *)final_seg, segments_to_convert_q_.size());
     }
     q_cv_.notify_one();
 }
@@ -200,7 +190,6 @@ void SBTree::insert(Key key, Value value)
         // --- (1) 若当前活跃段为空，执行自举安装 ---
         if (seg == nullptr)
         {
-            // fprintf(stderr, "[insert] shortcut is null\n");
 
             // 尝试创建新的活跃段（bootstrap）
             auto *new_seg = new SegmentedBlock();
@@ -252,7 +241,6 @@ void SBTree::insert(Key key, Value value)
                     {
                         std::lock_guard<std::mutex> lk(q_mu_);
                         segments_to_convert_q_.push_back(seg);
-                        idx_batches_enqueued_.fetch_add(1, std::memory_order_relaxed);
                     }
                     q_cv_.notify_one();
                 }
@@ -457,10 +445,5 @@ DataBlock *SBTree::find_candidate_(Key k) const
 {
     return search_.find_candidate(k);
 }
-
-uint64_t SBTree::index_batches_enqueued() const noexcept { return idx_batches_enqueued_.load(); }
-uint64_t SBTree::index_batches_applied() const noexcept { return idx_batches_applied_.load(); }
-uint64_t SBTree::index_items_enqueued() const noexcept { return idx_items_enqueued_.load(); }
-uint64_t SBTree::index_items_applied() const noexcept { return idx_items_applied_.load(); }
 
 std::size_t SBTree::index_levels() const { return search_.levels_snapshot(); }

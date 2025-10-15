@@ -61,10 +61,6 @@ public:
 
     // ========================= 索引控制接口 =========================
     void flush_index();                               // 阻塞，等待索引同步完成
-    uint64_t index_batches_enqueued() const noexcept; // 诊断统计：入队批次数
-    uint64_t index_batches_applied() const noexcept;  // 诊断统计：应用批次数
-    uint64_t index_items_enqueued() const noexcept;   // 诊断统计：入队数据块数
-    uint64_t index_items_applied() const noexcept;    // 诊断统计：已应用数据块数
     std::size_t index_levels() const;                 // 搜索层层数（加锁读取）
 
 private:
@@ -80,12 +76,6 @@ private:
     std::condition_variable q_cv_;                       // 队列条件变量
     std::atomic<bool> index_stop_{false};                // 线程停止标志
     std::atomic<size_t> index_in_flight_{0};             // 正在处理中的批次数
-
-    // ========================= 统计指标 =========================
-    std::atomic<uint64_t> idx_batches_enqueued_{0};
-    std::atomic<uint64_t> idx_batches_applied_{0};
-    std::atomic<uint64_t> idx_items_enqueued_{0};
-    std::atomic<uint64_t> idx_items_applied_{0};
 
     // ========================= 数据层 =========================
     std::atomic<Key> max_key_{0};
