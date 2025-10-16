@@ -1,99 +1,72 @@
 #pragma once
-#include <atomic>
-#include <mutex>
-#include <shared_mutex>
-#include <condition_variable>
-#include <thread>
-#include <deque>
+#include <vector>
 #include "KVPair.h"
-#include "SegmentedBlock.h"
+// SegmentedBlock.h 已被移除
 #include "DataBlock.h"
 #include "PerThreadDataBlock.h"
 #include "SearchLayer.h"
 
 // -----------------------------------------------------------------------------
-// SBTree
+// SBTree (最终单线程MVP版)
 // -----------------------------------------------------------------------------
 // 作用：
-//   - SB-Tree 主体类，管理搜索层与数据层的整体逻辑。
-//   - 提供插入、查找、扫描等外部接口。
-//   - 内部使用后台索引线程维护搜索层（SearchLayer），保证并发环境下的正确性。
+//   - SB-Tree 主体类，直接管理搜索层、数据层以及当前的活跃写入缓冲区。
+//   - 插入操作将同步完成数据转换和索引更新。
 // 并发语义：
-//   - 数据层（SegmentedBlock + PTB）支持多线程并发插入；
-//   - 搜索层由单独后台线程批量更新，读线程可并发访问；
-//   - 数据层链表需互斥保护，搜索层通过 shared_mutex 读写锁保护。
+//   - 此版本为单线程设计，不包含任何并发控制。
 // -----------------------------------------------------------------------------
 class SBTree
 {
 public:
     // ========================= 构造/析构 =========================
     SBTree();
-    ~SBTree(); // 负责释放 DataBlock 链表
+    ~SBTree(); // 负责释放 DataBlock 链表和活跃的写入缓冲区
 
     // ========================= 基本操作接口 =========================
-    void insert(Key key, Value value);                        // 顺序插入（假设 key 单调递增）
-    bool lookup(Key k, Value *out) const;                     // 查找
-    size_t scan(Key l, Key r, std::vector<Value> &out) const; // 范围扫描
+    void insert(Key key, Value value);
+    bool lookup(Key k, Value *out) const;
+    size_t scan(Key l, Key r, std::vector<Value> &out) const;
 
     // ========================= 测试/诊断接口 =========================
-    bool verify_data_layer(size_t expected_total_keys) const; // 遍历数据层验证正确性
-    void flush();                                             // 刷新段 → 数据块（立即转换）
+    bool verify_data_layer(size_t expected_total_keys) const;
+    void flush(); // 强制转换当前活跃的、可能未满的缓冲区
 
     // ========================= 区间游标 =========================
     class RangeCursor
     {
     public:
-        bool next(KVPair *out);                                    // 取下一个元素
-        size_t next_batch(std::vector<KVPair> &out, size_t limit); // 批量取元素
+        bool next(KVPair *out);
+        size_t next_batch(std::vector<KVPair> &out, size_t limit);
         inline bool valid() const noexcept { return blk_ != nullptr; }
 
     private:
         friend class SBTree;
         RangeCursor(const SBTree *owner, Key l, Key r, DataBlock *start);
-        void seek_first_pos_(); // 在当前块内定位到第一个 >= l 的元素
+        void seek_first_pos_();
 
-        const SBTree *owner_; // 指向宿主树
+        const SBTree *owner_;
         Key l_, r_;
-        DataBlock *blk_;  // 当前数据块
-        std::size_t idx_; // 当前块内索引
+        DataBlock *blk_;
+        std::size_t idx_;
     };
-    RangeCursor open_range_cursor(Key l, Key r) const; // 打开区间游标
+    RangeCursor open_range_cursor(Key l, Key r) const;
 
-    // ========================= 索引控制接口 =========================
-    void flush_index();                               // 阻塞，等待索引同步完成
-    uint64_t index_batches_enqueued() const noexcept; // 诊断统计：入队批次数
-    uint64_t index_batches_applied() const noexcept;  // 诊断统计：应用批次数
-    uint64_t index_items_enqueued() const noexcept;   // 诊断统计：入队数据块数
-    uint64_t index_items_applied() const noexcept;    // 诊断统计：已应用数据块数
-    std::size_t index_levels() const;                 // 搜索层层数（加锁读取）
+    // ========================= 索引状态接口 =========================
+    std::size_t index_levels() const;
 
 private:
     // ========================= 内部辅助 =========================
-    void index_worker_();                                        // 后台索引线程主循环
-    DataBlock *find_candidate_(Key k) const;                     // 在搜索层中查找候选块
-
-    // ========================= 并发控制 =========================
-    mutable std::shared_mutex search_mu_;                // 搜索层读写锁
-    std::thread index_thread_;                           // 专用索引维护线程
-    std::deque<SegmentedBlock *> segments_to_convert_q_; // 索引任务队列
-    std::mutex q_mu_;                                    // 队列锁
-    std::condition_variable q_cv_;                       // 队列条件变量
-    std::atomic<bool> index_stop_{false};                // 线程停止标志
-    std::atomic<size_t> index_in_flight_{0};             // 正在处理中的批次数
-
-    // ========================= 统计指标 =========================
-    std::atomic<uint64_t> idx_batches_enqueued_{0};
-    std::atomic<uint64_t> idx_batches_applied_{0};
-    std::atomic<uint64_t> idx_items_enqueued_{0};
-    std::atomic<uint64_t> idx_items_applied_{0};
+    DataBlock *find_candidate_(Key k) const;
+    // 新增：内部函数，负责将 active_buffer_ 转换为 DataBlock 并更新索引
+    void convert_active_buffer_();
 
     // ========================= 数据层 =========================
-    std::atomic<Key> max_key_{0};
-    std::atomic<SegmentedBlock *> shortcut_; // 当前活跃分段块
-    mutable std::mutex data_layer_lock_;     // 数据层链表锁
-    DataBlock *data_head_;                   // 数据链表头
-    DataBlock *data_tail_;                   // 数据链表尾
+    Key max_key_{0};
+    // shortcut_ 被替换为直接管理 PerThreadDataBlock
+    PerThreadDataBlock *active_buffer_; // 当前活跃的写入缓冲区
+    DataBlock *data_head_;
+    DataBlock *data_tail_;
 
     // ========================= 搜索层 =========================
-    SearchLayer search_; // 搜索层实例
+    SearchLayer search_;
 };

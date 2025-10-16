@@ -1,15 +1,16 @@
-# test/CMakeLists.txt
-include(GoogleTest)
+# test/CMakeLists.txt (修正版)
 
-# 小函数：1 行拉起一个 gtest 可执行并注册
-function(add_sbtest NAME)
-  add_executable(${NAME} ${ARGN})
-  target_link_libraries(${NAME} PRIVATE sb_tree GTest::gtest_main Threads::Threads)
-  gtest_discover_tests(${NAME})
-endfunction()
+# 添加一个可执行文件目标，名为 run_tests
+# 源文件是当前目录下的 TestAll.cpp
+add_executable(run_tests TestAll.cpp)
 
-# 现有Google_Test测试
-add_sbtest(test_basic_gtest test_basic_gtest.cpp)
-add_sbtest(test_concurrent_gtest test_concurrent_gtest.cpp)
-add_sbtest(test_internal_gtest test_internal_gtest.cpp)
-add_sbtest(sbtree_single_thread_test sbtree_single_thread_test.cpp)
+# 关键步骤：链接我们的测试程序和 SB-Tree 核心库
+# 确保这里的库名称与主 CMakeLists.txt 中定义的名称 "sb_tree" 完全一致
+target_link_libraries(run_tests PRIVATE sb_tree) # <-- 主要修改在这里
+
+# 将此可执行文件添加为 CTest 的一个测试用例
+# 这样我们就可以通过 `ctest` 命令来运行它
+add_test(
+    NAME sb_tree_unit_test
+    COMMAND run_tests
+)

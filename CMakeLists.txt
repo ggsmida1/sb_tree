@@ -10,15 +10,19 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# 定义 sb_tree 核心库
 add_library(sb_tree
     src/PerThreadDataBlock.cpp
-    src/SegmentedBlock.cpp
+    # --- 主要修改：移除了下面这一行，因为它已经被删除了 ---
+    # src/SegmentedBlock.cpp 
     src/DataBlock.cpp
     src/SBTree.cpp
     src/SearchLayer.cpp
 )
+# 为 sb_tree 库及其使用者（PUBLIC）提供头文件路径
 target_include_directories(sb_tree PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# --- 后续内容保持不变 ---
 find_package(Threads REQUIRED)
 
 include(FetchContent)
@@ -39,5 +43,4 @@ FetchContent_MakeAvailable(googletest benchmark)
 
 enable_testing()
 add_subdirectory(test)
-add_subdirectory(benchmark)
-
+# add_subdirectory(benchmark)
