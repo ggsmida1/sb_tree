@@ -9,7 +9,8 @@ function(add_sbtest NAME)
 endfunction()
 
 # 现有Google_Test测试
-add_sbtest(test_basic_gtest test_basic_gtest.cpp)
+# add_sbtest(test_basic_gtest test_basic_gtest.cpp)
+add_sbtest(segmented_block_gtest segmented_block_gtest.cpp)
 add_sbtest(test_concurrent_gtest test_concurrent_gtest.cpp)
-add_sbtest(test_internal_gtest test_internal_gtest.cpp)
+# add_sbtest(test_internal_gtest test_internal_gtest.cpp)
 add_sbtest(sbtree_single_thread_test sbtree_single_thread_test.cpp)
