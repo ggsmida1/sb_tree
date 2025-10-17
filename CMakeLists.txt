@@ -14,7 +14,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(sb_tree
     src/PerThreadDataBlock.cpp
     # --- 主要修改：移除了下面这一行，因为它已经被删除了 ---
-    # src/SegmentedBlock.cpp 
+    src/SegmentedBlock.cpp 
     src/DataBlock.cpp
     src/SBTree.cpp
     src/SearchLayer.cpp

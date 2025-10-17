@@ -138,3 +138,33 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make sbtree_benchmark
 
 ./benchmark/sbtree_benchmark
+
+
+# --------------------------------------------------
+# 步骤 0: 确保您在项目的根目录下
+# cd /path/to/your/sb_tree/project
+# --------------------------------------------------
+
+# 步骤 1: 彻底删除旧的 build 目录，确保一个干净的开始
+# 这是您特别要求的“删除当前build”的指令
+echo "正在清理旧的构建目录..."
+rm -rf build
+
+# 步骤 2: 重新创建 build 目录并进入
+echo "正在创建新的构建目录..."
+rm -rf build
+mkdir build
+cd build
+
+# 步骤 3: 运行 CMake 来配置项目并生成 Makefile
+echo "正在配置项目..."
+cmake ..
+
+# 步骤 4: 编译整个项目（包括核心库和测试程序）
+echo "正在编译项目..."
+cmake --build .
+
+# 步骤 5: 运行编译好的测试程序
+echo "正在运行测试..."
+./test/run_tests
+./test/run_mt_test

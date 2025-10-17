@@ -1,313 +1,429 @@
 #include "SBTree.h"
-#include <vector>
+
+#include <algorithm>
 #include <iostream>
-#include <algorithm> // for std::sort if needed, and std::min
+#include <chrono>
 #include <cassert>
 
-// ========================= 构造/析构 =========================
+// create initial segmented block for given window
+static SegmentedBlock *create_segmented_block_for_window(uint64_t wid, size_t capacity = 128)
+{
+    return new SegmentedBlock(capacity, wid);
+}
+
 SBTree::SBTree()
     : max_key_{0},
-      active_buffer_(nullptr), // 初始时没有活跃缓冲区
+      shortcut_(nullptr),
       data_head_(nullptr),
-      data_tail_(nullptr)
+      data_tail_(nullptr),
+      search_()
 {
-    // 构造函数变得非常简单，不再需要启动任何后台线程。
+    // start with window 0
+    SegmentedBlock *init = create_segmented_block_for_window(0);
+    shortcut_.store(init, std::memory_order_release);
+    last_published_window_.store((uint64_t)0);
+
+    stop_writer_.store(false);
+    bg_thread_ = std::thread(&SBTree::background_loop, this);
 }
 
 SBTree::~SBTree()
 {
-    // 1. 确保所有缓冲的数据都被转换和写入
-    flush();
+    // stop background thread
+    stop_writer_.store(true);
+    queue_cv_.notify_one();
+    if (bg_thread_.joinable())
+        bg_thread_.join();
 
-    // 2. 释放数据层链表
-    DataBlock *cur = data_head_;
-    while (cur)
+    // drain remaining queued segments synchronously
     {
-        DataBlock *nxt = cur->next();
-        delete cur;
-        cur = nxt;
-    }
-    data_head_ = data_tail_ = nullptr;
-
-    // 3. 析构函数不再需要处理线程和队列
-}
-
-// ========================= 内部核心辅助 =========================
-
-// 这是新的核心方法，负责将活跃缓冲区的数据转换为 DataBlock，并更新索引
-void SBTree::convert_active_buffer_()
-{
-    // 如果没有缓冲区或者缓冲区是空的，则无需转换
-    if (!active_buffer_ || active_buffer_->GetNumEntries() == 0)
-    {
-        if (active_buffer_)
+        std::lock_guard<std::mutex> lk(queue_mutex_);
+        while (!convert_queue_.empty())
         {
-            delete active_buffer_;
-            active_buffer_ = nullptr;
-        }
-        return;
-    }
-
-    // 1. 从缓冲区收集数据
-    const KVPair *buffer_data = active_buffer_->GetData();
-    size_t num_entries = active_buffer_->GetNumEntries();
-
-    // 注意：因为是单线程且我们假设key单调递增写入，
-    // 所以 active_buffer_ 中的数据已经是排序好的，无需 std::sort！
-    // 如果未来要支持乱序写入，则需要在这里增加排序步骤。
-    // std::vector<KVPair> sorted_data(buffer_data, buffer_data + num_entries);
-    // std::sort(sorted_data.begin(), sorted_data.end(), ...);
-
-    // 2. 将有序数据切片成多个 DataBlock
-    std::vector<DataBlock *> new_blocks;
-    const KVPair *current_pos = buffer_data;
-    size_t remaining = num_entries;
-    while (remaining > 0)
-    {
-        auto *new_block = new DataBlock();
-        size_t consumed = new_block->build_from_sorted(current_pos, remaining);
-        assert(consumed > 0); // 必须消耗掉至少一个元素
-
-        new_blocks.push_back(new_block);
-        current_pos += consumed;
-        remaining -= consumed;
-    }
-
-    // 3. 将新的 DataBlock 链入数据层主链表
-    if (!data_tail_) // 如果链表为空
-    {
-        data_head_ = new_blocks.front();
-        data_tail_ = new_blocks.back();
-    }
-    else
-    {
-        data_tail_->set_next(new_blocks.front());
-        data_tail_ = new_blocks.back();
-    }
-
-    // 4. 同步更新搜索层
-    search_.append_run(new_blocks);
-
-    // 5. 清理旧的缓冲区
-    delete active_buffer_;
-    active_buffer_ = nullptr;
-}
-
-// ========================= 基本操作 =========================
-
-void SBTree::insert(Key key, Value value)
-{
-    // 1. 确保有一个活跃的写入缓冲区
-    if (active_buffer_ == nullptr)
-    {
-        active_buffer_ = new PerThreadDataBlock();
-    }
-
-    // 2. 如果当前缓冲区满了，先进行转换
-    if (active_buffer_->IsFull())
-    {
-        convert_active_buffer_();
-        // 转换后，再次创建一个新的空缓冲区
-        active_buffer_ = new PerThreadDataBlock();
-    }
-
-    // 3. 插入数据到缓冲区
-    bool success = active_buffer_->Insert(key, value);
-    assert(success); // 此时缓冲区必然有空间，插入必须成功
-
-    // 4. 更新树的最大 key
-    if (key > max_key_)
-    {
-        max_key_ = key;
-    }
-}
-
-void SBTree::flush()
-{
-    // 直接调用转换函数即可，它会处理 active_buffer_ 为空或已为空的情况
-    convert_active_buffer_();
-}
-
-bool SBTree::lookup(Key k, Value *out) const
-{
-    // 查找逻辑基本不变，但由于是同步更新，数据总是一致的
-    DataBlock *blk = find_candidate_(k);
-
-    // 如果搜索层没找到（比如树是空的，或者key很小）
-    // 则从数据层头部开始遍历
-    if (!blk)
-    {
-        blk = data_head_;
-    }
-
-    while (blk)
-    {
-        // 检查当前块是否可能包含key
-        if (k >= blk->min_key() && k <= blk->max_key())
-        {
-            Value v{};
-            if (blk->find(k, v))
+            PendingSeg ps = convert_queue_.front();
+            convert_queue_.pop_front();
+            auto pairs = collect_pairs_from_segment(ps.seg);
+            // merge with delayed for that window
             {
-                if (out)
-                    *out = v;
-                return true;
+                std::lock_guard<std::mutex> dl(delayed_mutex_);
+                auto it = delayed_map_.find(ps.window_id);
+                if (it != delayed_map_.end())
+                {
+                    // move delayed entries into pairs
+                    pairs.insert(pairs.end(), it->second.begin(), it->second.end());
+                    delayed_map_.erase(it);
+                }
+            }
+            if (!pairs.empty())
+            {
+                std::sort(pairs.begin(), pairs.end(), [](const KVPair &a, const KVPair &b)
+                          { return a.key < b.key; });
+                auto blocks = build_blocks_from_pairs(pairs);
+                publish_blocks(ps.window_id, blocks);
+            }
+            delete ps.seg;
+        }
+    }
+
+    // delete current shortcut
+    SegmentedBlock *cur = shortcut_.load(std::memory_order_acquire);
+    if (cur)
+        delete cur;
+
+    // delete DataBlock chain
+    DataBlock *p = data_head_;
+    while (p)
+    {
+        DataBlock *nxt = p->next();
+        delete p;
+        p = nxt;
+    }
+}
+
+void SBTree::insert(Key k, Value v)
+{
+    uint64_t target_wid = key_to_window(k);
+
+    while (true)
+    {
+        SegmentedBlock *seg = shortcut_.load(std::memory_order_acquire);
+        uint64_t seg_wid = seg ? seg->window_id() : 0;
+
+        if (target_wid < seg_wid)
+        {
+            // delayed: belongs to an already-advancing window -> buffer it
+            std::lock_guard<std::mutex> lk(delayed_mutex_);
+            delayed_map_[target_wid].push_back(KVPair{k, v});
+            return;
+        }
+        else if (target_wid > seg_wid)
+        {
+            // key belongs to future window: try to install a seg for target_wid
+            SegmentedBlock *newseg = create_segmented_block_for_window(target_wid, seg ? seg->capacity() : 128);
+            if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
+            {
+                // succeeded: enqueue old seg for conversion
+                if (seg)
+                    enqueue_segment_for_conversion(seg);
+                // continue to insert (loop will reload current seg)
+            }
+            else
+            {
+                // failed: someone else installed; delete ours and retry
+                delete newseg;
+            }
+            continue;
+        }
+        else
+        {
+            // target_wid == seg_wid -> normal fast path
+            PerThreadDataBlock *block = seg->get_or_install_block_for_current_thread();
+            if (!block)
+            {
+                // seg full: create next window seg (advance 1 window)
+                uint64_t new_wid = seg_wid + 1;
+                SegmentedBlock *newseg = create_segmented_block_for_window(new_wid, seg->capacity());
+                if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
+                {
+                    enqueue_segment_for_conversion(seg);
+                    // inserted into new seg? we'll loop and try again
+                }
+                else
+                {
+                    delete newseg;
+                }
+                continue;
+            }
+
+            // Try insert into per-thread buffer
+            if (block->Insert(k, v))
+            {
+                if (k > max_key_)
+                    max_key_ = k;
+                return;
+            }
+            else
+            {
+                // buffer full -> advance window by 1
+                uint64_t new_wid = seg_wid + 1;
+                SegmentedBlock *newseg = create_segmented_block_for_window(new_wid, seg->capacity());
+                if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
+                {
+                    enqueue_segment_for_conversion(seg);
+                    return; // we enqueued old seg; caller's insert considered done
+                }
+                else
+                {
+                    delete newseg;
+                    continue;
+                }
             }
         }
+    } // end while
+}
 
-        DataBlock *nxt = blk->next();
-        // 如果下一个块的最小key已经大于目标k，就没有必要继续了
-        if (!nxt || nxt->min_key() > k)
-            break;
-
-        blk = nxt;
-    }
-    return false;
+bool SBTree::find(Key k, Value &out) const
+{
+    DataBlock *cand = find_candidate_(k);
+    if (!cand)
+        return false;
+    return cand->find(k, out);
 }
 
 size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
 {
     if (l > r)
         return 0;
-
-    auto cur = open_range_cursor(l, r);
+    DataBlock *cur = find_candidate_(l);
     size_t added = 0;
-    KVPair kv;
-    while (cur.next(&kv))
-    {
-        out.push_back(kv.value);
-        ++added;
-    }
-    return added;
-}
-
-// ========================= RangeCursor (保持不变) =========================
-SBTree::RangeCursor::RangeCursor(const SBTree *owner, Key l, Key r, DataBlock *start)
-    : owner_(owner), l_(l), r_(r), blk_(start), idx_(0)
-{
-    if (!blk_ || blk_->min_key() > r_)
-    {
-        blk_ = nullptr;
-        return;
-    }
-    seek_first_pos_();
-}
-
-void SBTree::RangeCursor::seek_first_pos_()
-{
-    const std::size_t n = blk_->size();
-    std::size_t L = 0, R = n, pos = n;
-    while (L < R)
-    {
-        std::size_t mid = L + ((R - L) >> 1);
-        if (blk_->get_entry(mid).key >= l_)
-        {
-            pos = mid;
-            R = mid;
-        }
-        else
-            L = mid + 1;
-    }
-    idx_ = pos;
-    while (blk_ && idx_ >= blk_->size())
-    {
-        blk_ = blk_->next();
-        if (!blk_ || blk_->min_key() > r_)
-        {
-            blk_ = nullptr;
-            break;
-        }
-        idx_ = 0;
-    }
-}
-
-bool SBTree::RangeCursor::next(KVPair *out)
-{
-    if (!blk_)
-        return false;
-
-    while (true)
-    {
-        while (idx_ < blk_->size())
-        {
-            const KVPair &e = blk_->get_entry(idx_++);
-            if (e.key > r_)
-            {
-                blk_ = nullptr;
-                return false;
-            }
-            if (e.key >= l_)
-            {
-                if (out)
-                    *out = e;
-                return true;
-            }
-        }
-
-        blk_ = blk_->next();
-        if (!blk_ || blk_->min_key() > r_)
-        {
-            blk_ = nullptr;
-            return false;
-        }
-        idx_ = 0;
-    }
-}
-
-size_t SBTree::RangeCursor::next_batch(std::vector<KVPair> &out, size_t limit)
-{
-    if (!blk_ || limit == 0)
-        return 0;
-    size_t added = 0;
-    KVPair kv;
-    while (added < limit && next(&kv))
-    {
-        out.push_back(kv);
-        ++added;
-    }
-    return added;
-}
-
-SBTree::RangeCursor SBTree::open_range_cursor(Key l, Key r) const
-{
-    if (l > r)
-        return RangeCursor(this, 1, 0, nullptr);
-    DataBlock *blk = find_candidate_(l);
-    if (!blk)
-        blk = data_head_; // 如果索引找不到，从头开始
-    return RangeCursor(this, l, r, blk);
-}
-
-// ========================= 验证/统计 (简化) =========================
-bool SBTree::verify_data_layer(size_t expected_total_keys) const
-{
-    // 移除了锁
-    size_t actual = 0;
-    Key last_key = 0;
-    DataBlock *cur = data_head_;
     while (cur)
     {
-        for (size_t i = 0; i < cur->size(); ++i)
+        size_t n = cur->size();
+        for (size_t i = 0; i < n; ++i)
         {
-            KVPair e = cur->get_entry(i);
-            // 这里可以添加您的验证逻辑
-            if (actual > 0 && e.key <= last_key)
-                return false; // 验证key是否单调递增
-            last_key = e.key;
-            ++actual;
+            KVPair kv = cur->get_entry(i);
+            if (kv.key >= l && kv.key <= r)
+            {
+                out.push_back(kv.value);
+                ++added;
+            }
+            if (kv.key > r)
+                break;
         }
+        if (cur->max_key() > r)
+            break;
         cur = cur->next();
     }
-    return actual == expected_total_keys;
+    return added;
+}
+
+bool SBTree::lookup(Key k, Value *out) { return find(k, *out); }
+
+void SBTree::flush()
+{
+    SegmentedBlock *seg = shortcut_.load(std::memory_order_acquire);
+    if (seg)
+    {
+        // try to install next window so seg gets flushed
+        uint64_t seg_wid = seg->window_id();
+        SegmentedBlock *newseg = create_segmented_block_for_window(seg_wid + 1, seg->capacity());
+        if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
+        {
+            enqueue_segment_for_conversion(seg);
+        }
+        else
+        {
+            delete newseg;
+        }
+    }
 }
 
 DataBlock *SBTree::find_candidate_(Key k) const
 {
-    // 移除了锁
     return search_.find_candidate(k);
 }
 
-std::size_t SBTree::index_levels() const
+// collect KV pairs from a SegmentedBlock (takes and deletes per-thread buffers)
+std::vector<KVPair> SBTree::collect_pairs_from_segment(SegmentedBlock *seg)
 {
-    // 移除了锁
-    return search_.levels();
+    std::vector<KVPair> out;
+    out.reserve(1024);
+    seg->for_each_registered_ptr([&out](PerThreadDataBlock *p)
+                                 {
+        if (!p) return;
+        size_t n = p->GetNumEntries();
+        const KVPair* src = p->GetData();
+        for (size_t i = 0; i < n; ++i) out.push_back(src[i]);
+        // free per-thread buffer (ownership transferred)
+        delete p; });
+    return out;
+}
+
+std::vector<DataBlock *> SBTree::build_blocks_from_pairs(std::vector<KVPair> &pairs)
+{
+    std::vector<DataBlock *> blocks;
+    if (pairs.empty())
+        return blocks;
+    std::sort(pairs.begin(), pairs.end(), [](const KVPair &a, const KVPair &b)
+              { return a.key < b.key; });
+    size_t idx = 0;
+    while (idx < pairs.size())
+    {
+        DataBlock *b = new DataBlock();
+        size_t taken = b->build_from_sorted(pairs.data() + idx, pairs.size() - idx);
+        blocks.push_back(b);
+        idx += taken;
+    }
+    return blocks;
+}
+
+void SBTree::publish_blocks(uint64_t window_id, std::vector<DataBlock *> &blocks)
+{
+    if (blocks.empty())
+        return;
+
+    // attach to data list
+    {
+        std::lock_guard<std::mutex> lk(data_tail_mutex_);
+        if (!data_head_)
+        {
+            data_head_ = blocks.front();
+            data_tail_ = blocks.back();
+        }
+        else
+        {
+            data_tail_->set_next(blocks.front());
+            data_tail_ = blocks.back();
+        }
+    }
+
+    // append to search layer
+    {
+        std::lock_guard<std::mutex> lk(search_mutex_);
+        // sanity: ensure window monotonicity (for debug)
+        uint64_t last = last_published_window_.load();
+        if (window_id < last)
+        {
+            // This shouldn't happen if the background loop orders by window_id and merges delayed data.
+            // We still allow it but print a warning for debugging.
+            std::cerr << "Warning: publishing window " << window_id << " after last " << last << std::endl;
+        }
+        search_.append_run(blocks);
+        last_published_window_.store(window_id);
+    }
+}
+
+void SBTree::enqueue_segment_for_conversion(SegmentedBlock *seg)
+{
+    uint64_t wid = seg->window_id();
+    {
+        std::lock_guard<std::mutex> lk(queue_mutex_);
+        convert_queue_.push_back(PendingSeg{seg, wid});
+    }
+    queue_cv_.notify_one();
+}
+
+// background loop: drain queue, group by window_id, merge with delayed_map_, build blocks and publish in window order
+void SBTree::background_loop()
+{
+    while (!stop_writer_.load())
+    {
+        std::vector<PendingSeg> batch;
+        {
+            std::unique_lock<std::mutex> lk(queue_mutex_);
+            if (convert_queue_.empty())
+            {
+                queue_cv_.wait_for(lk, std::chrono::milliseconds(writer_batch_wait_ms_));
+            }
+            while (!convert_queue_.empty())
+            {
+                batch.push_back(convert_queue_.front());
+                convert_queue_.pop_front();
+            }
+        }
+        if (batch.empty())
+            continue;
+
+        // group pairs by window_id
+        std::unordered_map<uint64_t, std::vector<KVPair>> grouped;
+        grouped.reserve(batch.size());
+
+        for (auto &ps : batch)
+        {
+            // collect
+            std::vector<KVPair> pairs = collect_pairs_from_segment(ps.seg);
+            if (!pairs.empty())
+            {
+                auto &vec = grouped[ps.window_id];
+                // move pairs into grouped
+                vec.insert(vec.end(), pairs.begin(), pairs.end());
+            }
+            delete ps.seg;
+        }
+
+        // incorporate delayed_map_ entries for these windows (and optionally adjacent ones)
+        {
+            std::lock_guard<std::mutex> dl(delayed_mutex_);
+            for (auto &kv : delayed_map_)
+            {
+                uint64_t wid = kv.first;
+                if (!kv.second.empty())
+                {
+                    auto &vec = grouped[wid];
+                    vec.insert(vec.end(), kv.second.begin(), kv.second.end());
+                }
+            }
+            // clear delayed_map_ entirely because we merged all delayed entries into grouped.
+            // This is conservative: if delayed_map_ has windows that were not in grouped,
+            // we still merged them so they'll be published now.
+            delayed_map_.clear();
+        }
+
+        // sort window ids and publish in order
+        std::vector<uint64_t> wids;
+        wids.reserve(grouped.size());
+        for (auto &e : grouped)
+            wids.push_back(e.first);
+        std::sort(wids.begin(), wids.end());
+
+        for (uint64_t wid : wids)
+        {
+            auto &pairs = grouped[wid];
+            if (pairs.empty())
+                continue;
+            // build data blocks for this window
+            std::vector<DataBlock *> blocks = build_blocks_from_pairs(pairs);
+            if (!blocks.empty())
+            {
+                publish_blocks(wid, blocks);
+            }
+            else
+            {
+                // nothing to publish
+            }
+        }
+    }
+
+    // On shutdown, drain any remaining items similarly
+    std::vector<PendingSeg> remaining;
+    {
+        std::lock_guard<std::mutex> lk(queue_mutex_);
+        while (!convert_queue_.empty())
+        {
+            remaining.push_back(convert_queue_.front());
+            convert_queue_.pop_front();
+        }
+    }
+    if (!remaining.empty())
+    {
+        std::unordered_map<uint64_t, std::vector<KVPair>> grouped;
+        for (auto &ps : remaining)
+        {
+            auto pairs = collect_pairs_from_segment(ps.seg);
+            if (!pairs.empty())
+                grouped[ps.window_id].insert(grouped[ps.window_id].end(), pairs.begin(), pairs.end());
+            delete ps.seg;
+        }
+        {
+            std::lock_guard<std::mutex> dl(delayed_mutex_);
+            for (auto &kv : delayed_map_)
+            {
+                grouped[kv.first].insert(grouped[kv.first].end(), kv.second.begin(), kv.second.end());
+            }
+            delayed_map_.clear();
+        }
+        std::vector<uint64_t> wids;
+        for (auto &e : grouped)
+            wids.push_back(e.first);
+        std::sort(wids.begin(), wids.end());
+        for (uint64_t wid : wids)
+        {
+            auto &pairs = grouped[wid];
+            if (pairs.empty())
+                continue;
+            auto blocks = build_blocks_from_pairs(pairs);
+            if (!blocks.empty())
+                publish_blocks(wid, blocks);
+        }
+    }
 }

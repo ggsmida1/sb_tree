@@ -1,72 +1,96 @@
 #pragma once
+
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <memory>
+#include <thread>
+#include <condition_variable>
+#include <deque>
+#include <unordered_map>
+
 #include "KVPair.h"
-// SegmentedBlock.h 已被移除
 #include "DataBlock.h"
 #include "PerThreadDataBlock.h"
 #include "SearchLayer.h"
+#include "SegmentedBlock.h"
 
-// -----------------------------------------------------------------------------
-// SBTree (最终单线程MVP版)
-// -----------------------------------------------------------------------------
-// 作用：
-//   - SB-Tree 主体类，直接管理搜索层、数据层以及当前的活跃写入缓冲区。
-//   - 插入操作将同步完成数据转换和索引更新。
-// 并发语义：
-//   - 此版本为单线程设计，不包含任何并发控制。
-// -----------------------------------------------------------------------------
+// SBTree with windowed segmented blocks and delayed-data handling
 class SBTree
 {
 public:
-    // ========================= 构造/析构 =========================
     SBTree();
-    ~SBTree(); // 负责释放 DataBlock 链表和活跃的写入缓冲区
+    ~SBTree();
 
-    // ========================= 基本操作接口 =========================
-    void insert(Key key, Value value);
-    bool lookup(Key k, Value *out) const;
+    // basic API
+    void insert(Key k, Value v);
+    bool find(Key k, Value &out) const;
     size_t scan(Key l, Key r, std::vector<Value> &out) const;
 
-    // ========================= 测试/诊断接口 =========================
-    bool verify_data_layer(size_t expected_total_keys) const;
-    void flush(); // 强制转换当前活跃的、可能未满的缓冲区
+    // compatibility
+    bool lookup(Key k, Value *out);
+    void flush();
 
-    // ========================= 区间游标 =========================
-    class RangeCursor
-    {
-    public:
-        bool next(KVPair *out);
-        size_t next_batch(std::vector<KVPair> &out, size_t limit);
-        inline bool valid() const noexcept { return blk_ != nullptr; }
-
-    private:
-        friend class SBTree;
-        RangeCursor(const SBTree *owner, Key l, Key r, DataBlock *start);
-        void seek_first_pos_();
-
-        const SBTree *owner_;
-        Key l_, r_;
-        DataBlock *blk_;
-        std::size_t idx_;
-    };
-    RangeCursor open_range_cursor(Key l, Key r) const;
-
-    // ========================= 索引状态接口 =========================
     std::size_t index_levels() const;
 
 private:
-    // ========================= 内部辅助 =========================
+    // helpers
     DataBlock *find_candidate_(Key k) const;
-    // 新增：内部函数，负责将 active_buffer_ 转换为 DataBlock 并更新索引
-    void convert_active_buffer_();
 
-    // ========================= 数据层 =========================
+    // conversion helpers: collect pairs from a SegmentedBlock
+    std::vector<KVPair> collect_pairs_from_segment(SegmentedBlock *seg);
+
+    // build DataBlocks from merged KV pairs
+    std::vector<DataBlock *> build_blocks_from_pairs(std::vector<KVPair> &pairs);
+
+    // publish (attach and append_run)
+    void publish_blocks(uint64_t window_id, std::vector<DataBlock *> &blocks);
+
+    // enqueue for background conversion
+    void enqueue_segment_for_conversion(SegmentedBlock *seg);
+
+    // background worker
+    void background_loop();
+
+    // mapping key -> window
+    uint64_t key_to_window(Key k) const { return static_cast<uint64_t>(k) / WINDOW_SIZE; }
+
+    // members
     Key max_key_{0};
-    // shortcut_ 被替换为直接管理 PerThreadDataBlock
-    PerThreadDataBlock *active_buffer_; // 当前活跃的写入缓冲区
+
+    std::atomic<SegmentedBlock *> shortcut_{nullptr};
+
+    // published data chain
     DataBlock *data_head_;
     DataBlock *data_tail_;
+    std::mutex data_tail_mutex_;
 
-    // ========================= 搜索层 =========================
+    // search layer
     SearchLayer search_;
+    mutable std::mutex search_mutex_;
+
+    // conversion queue (seg + window_id)
+    struct PendingSeg
+    {
+        SegmentedBlock *seg;
+        uint64_t window_id;
+    };
+    std::deque<PendingSeg> convert_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+
+    // delayed map: window_id -> vector<KVPair>
+    std::unordered_map<uint64_t, std::vector<KVPair>> delayed_map_;
+    std::mutex delayed_mutex_;
+
+    // background thread
+    std::atomic<bool> stop_writer_{false};
+    std::thread bg_thread_;
+
+    // last published window (monotonic)
+    std::atomic<uint64_t> last_published_window_{0};
+
+    // parameters
+    static constexpr uint64_t WINDOW_SIZE = 1000000ULL;
+    size_t writer_batch_wait_ms_ = 20;
 };
