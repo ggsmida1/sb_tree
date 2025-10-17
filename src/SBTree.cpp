@@ -1,3 +1,4 @@
+// SBTree.cpp (modified)
 #include "SBTree.h"
 
 #include <algorithm>
@@ -25,6 +26,9 @@ SBTree::SBTree()
 
     stop_writer_.store(false);
     bg_thread_ = std::thread(&SBTree::background_loop, this);
+
+    // 初始化新的 SearchNode 根（叶子）
+    sn_root_ = std::make_unique<SearchNode>(SearchNode::NodeType::Leaf, SN_FANOUT);
 }
 
 SBTree::~SBTree()
@@ -80,6 +84,26 @@ SBTree::~SBTree()
     }
 }
 
+// *** MODIFIED: helper - encapsulate advance + enqueue CAS semantics
+void SBTree::advance_to_next_window(SegmentedBlock *old_seg)
+{
+    if (!old_seg)
+        return;
+    uint64_t new_wid = old_seg->window_id() + 1;
+    SegmentedBlock *newseg = create_segmented_block_for_window(new_wid, old_seg->capacity());
+    // try to atomically install new seg as shortcut; if succeed, enqueue old for conversion
+    SegmentedBlock *expected = old_seg;
+    if (shortcut_.compare_exchange_strong(expected, newseg, std::memory_order_acq_rel))
+    {
+        enqueue_segment_for_conversion(old_seg);
+    }
+    else
+    {
+        // someone else advanced; drop ours
+        delete newseg;
+    }
+}
+
 void SBTree::insert(Key k, Value v)
 {
     uint64_t target_wid = key_to_window(k);
@@ -91,14 +115,23 @@ void SBTree::insert(Key k, Value v)
 
         if (target_wid < seg_wid)
         {
-            // delayed: belongs to an already-advancing window -> buffer it
-            std::lock_guard<std::mutex> lk(delayed_mutex_);
-            delayed_map_[target_wid].push_back(KVPair{k, v});
+            // 历史窗口：改为直接落地到数据层（有序插入，必要时分裂）
+            insert_delayed_(k, v);
             return;
         }
         else if (target_wid > seg_wid)
         {
             // key belongs to future window: try to install a seg for target_wid
+            // *** MODIFIED: do NOT allow skipping many windows eagerly.
+            // If target_wid is beyond seg_wid+1, buffer into delayed_map_ instead of creating far-future seg.
+            if (target_wid > seg_wid + 1)
+            {
+                // 远未来窗口：直接落地到数据层，避免长时间滞留
+                insert_delayed_(k, v);
+                return;
+            }
+
+            // otherwise attempt to advance by one (to seg_wid+1) or to target_wid (if equals)
             SegmentedBlock *newseg = create_segmented_block_for_window(target_wid, seg ? seg->capacity() : 128);
             if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
             {
@@ -117,21 +150,24 @@ void SBTree::insert(Key k, Value v)
         else
         {
             // target_wid == seg_wid -> normal fast path
+            // If segment already marked converting, retry to pick up new shortcut
+            if (seg->is_converting())
+            {
+                // queued for conversion, try again to get the new shortcut
+                std::this_thread::yield();
+                continue;
+            }
+
             PerThreadDataBlock *block = seg->get_or_install_block_for_current_thread();
             if (!block)
             {
-                // seg full: create next window seg (advance 1 window)
-                uint64_t new_wid = seg_wid + 1;
-                SegmentedBlock *newseg = create_segmented_block_for_window(new_wid, seg->capacity());
-                if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
+                // seg has no available slot: mark converting (first-wins) and advance window
+                // *** MODIFIED: use try_mark_converting() to ensure only one thread triggers conversion
+                if (seg->try_mark_converting())
                 {
-                    enqueue_segment_for_conversion(seg);
-                    // inserted into new seg? we'll loop and try again
+                    advance_to_next_window(seg);
                 }
-                else
-                {
-                    delete newseg;
-                }
+                // whether we won or lost, retry loop to get new seg
                 continue;
             }
 
@@ -144,30 +180,90 @@ void SBTree::insert(Key k, Value v)
             }
             else
             {
-                // buffer full -> advance window by 1
-                uint64_t new_wid = seg_wid + 1;
-                SegmentedBlock *newseg = create_segmented_block_for_window(new_wid, seg->capacity());
-                if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
+                // buffer full -> instead of immediately creating many small segments,
+                // we only mark segment as converting; the first thread to succeed will advance the window.
+                // *** MODIFIED: use try_mark_converting() first (first-wins)
+                if (seg->try_mark_converting())
                 {
-                    enqueue_segment_for_conversion(seg);
-                    return; // we enqueued old seg; caller's insert considered done
+                    // this thread is responsible for installing next window and triggering conversion
+                    advance_to_next_window(seg);
                 }
-                else
-                {
-                    delete newseg;
-                    continue;
-                }
+                // whether we won or not, retry to insert into newly installed segment
+                continue;
             }
         }
     } // end while
 }
 
+// delayed insert: locate target DataBlock via search layer and data-layer correction,
+// then insert in-order; split if full and publish new right block into search layer
+bool SBTree::insert_delayed_(Key k, Value v)
+{
+    // 通过搜索层找候选块
+    DataBlock *cur = find_candidate_(k);
+    // 若无候选，从数据头开始
+    if (!cur)
+        cur = data_head_;
+
+    // 沿链表前进到第一个可能覆盖 k 的块（max_key >= k）
+    while (cur && cur->max_key() < k)
+        cur = cur->next();
+
+    if (!cur)
+        return false;
+
+    // 在当前块尝试插入；若失败且下一块存在，尝试下一块
+    for (int attempt = 0; attempt < 2 && cur; ++attempt)
+    {
+        DataBlock *newRight = nullptr;
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lk(data_layer_mutex_);
+            ok = cur->insert_sorted(k, v, &newRight);
+            if (ok)
+            {
+                if (newRight)
+                {
+                    // 发布到旧索引与新索引
+                    std::vector<DataBlock *> run;
+                    run.push_back(newRight);
+                    publish_blocks(key_to_window(newRight->min_key()), run);
+                    sn_insert_block_(newRight);
+                }
+                return true;
+            }
+        }
+        cur = cur->next();
+    }
+    return false;
+}
+
 bool SBTree::find(Key k, Value &out) const
 {
-    DataBlock *cand = find_candidate_(k);
-    if (!cand)
+    DataBlock *cur = find_candidate_(k);
+    if (!cur)
         return false;
-    return cand->find(k, out);
+
+    // 尝试在候选块查找；若未命中且 key 超过当前块范围，则沿链表纠偏到覆盖该 key 的块
+    for (;;)
+    {
+        if (cur->find(k, out))
+            return true;
+
+        // 若目标 key 小于当前块最小值，则不存在
+        if (k < cur->min_key())
+            return false;
+
+        // 若目标 key 大于当前块最大值，沿 next() 前进；否则未命中即不存在
+        if (k > cur->max_key())
+        {
+            cur = cur->next();
+            if (!cur)
+                return false;
+            continue;
+        }
+        return false;
+    }
 }
 
 size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
@@ -175,6 +271,10 @@ size_t SBTree::scan(Key l, Key r, std::vector<Value> &out) const
     if (l > r)
         return 0;
     DataBlock *cur = find_candidate_(l);
+    if (!cur)
+        cur = data_head_;
+    while (cur && cur->max_key() < l)
+        cur = cur->next();
     size_t added = 0;
     while (cur)
     {
@@ -220,14 +320,33 @@ void SBTree::flush()
 
 DataBlock *SBTree::find_candidate_(Key k) const
 {
+    // 优先从新的 SearchNode 根查找
+    if (sn_root_)
+    {
+        DataBlock *cand = nullptr;
+        // 叶层或单层树
+        cand = sn_root_->FindDataBlock(k);
+        if (cand)
+            return cand;
+    }
+    // 回退到旧的 SearchLayer
     return search_.find_candidate(k);
 }
 
 // collect KV pairs from a SegmentedBlock (takes and deletes per-thread buffers)
+// *** MODIFIED: Before copying we Freeze each per-thread buffer to avoid races with in-flight writers.
 std::vector<KVPair> SBTree::collect_pairs_from_segment(SegmentedBlock *seg)
 {
     std::vector<KVPair> out;
     out.reserve(1024);
+
+    // First, freeze all per-thread buffers so writers stop (Freeze sets frozen_ flag)
+    seg->for_each_registered_ptr([](PerThreadDataBlock *p)
+                                 {
+        if (p)
+            p->Freeze(); });
+
+    // Now safely collect data (writers will have observed frozen_ and stopped)
     seg->for_each_registered_ptr([&out](PerThreadDataBlock *p)
                                  {
         if (!p) return;
@@ -290,6 +409,14 @@ void SBTree::publish_blocks(uint64_t window_id, std::vector<DataBlock *> &blocks
         }
         search_.append_run(blocks);
         last_published_window_.store(window_id);
+
+        // 同步将 run 的首块插入新的 SearchNode 根（渐进迁移，至少保证可定位）
+        if (sn_root_ && !blocks.empty())
+        {
+            // 将 run 的每个块都插入新索引，保证更好的可定位性
+            for (DataBlock *b : blocks)
+                sn_insert_block_(b);
+        }
     }
 }
 
@@ -304,6 +431,8 @@ void SBTree::enqueue_segment_for_conversion(SegmentedBlock *seg)
 }
 
 // background loop: drain queue, group by window_id, merge with delayed_map_, build blocks and publish in window order
+// *** MODIFIED: Only merge delayed_map_ entries corresponding to windows present in grouped,
+// and remove merged items from delayed_map_ instead of clearing entire map.
 void SBTree::background_loop()
 {
     while (!stop_writer_.load())
@@ -322,11 +451,65 @@ void SBTree::background_loop()
             }
         }
         if (batch.empty())
+        {
+            // 无段转换任务时，主动冲刷 delayed_map_，避免延迟数据饥饿
+            // 仅当存在延迟窗口时进行；一次处理有限数量窗口以控制抖动
+            std::unordered_map<uint64_t, std::vector<KVPair>> delayed_take;
+            std::vector<uint64_t> wid_list;
+            {
+                std::lock_guard<std::mutex> dl(delayed_mutex_);
+                if (!delayed_map_.empty())
+                {
+                    // 取前若干窗口（按窗口 id 升序）
+                    wid_list.reserve(delayed_map_.size());
+                    for (auto &e : delayed_map_)
+                        wid_list.push_back(e.first);
+                    std::sort(wid_list.begin(), wid_list.end());
+                    const size_t kMaxWindowsPerTick = 4;
+                    if (wid_list.size() > kMaxWindowsPerTick)
+                        wid_list.resize(kMaxWindowsPerTick);
+                    for (uint64_t wid : wid_list)
+                    {
+                        auto it = delayed_map_.find(wid);
+                        if (it != delayed_map_.end() && !it->second.empty())
+                        {
+                            delayed_take.emplace(wid, std::move(it->second));
+                            delayed_map_.erase(it);
+                        }
+                    }
+                }
+            }
+
+            if (!delayed_take.empty())
+            {
+                // 将抽取的延迟窗口构建并发布
+                std::vector<uint64_t> wids;
+                wids.reserve(delayed_take.size());
+                for (auto &e : delayed_take)
+                    wids.push_back(e.first);
+                std::sort(wids.begin(), wids.end());
+
+                for (uint64_t wid : wids)
+                {
+                    auto &pairs = delayed_take[wid];
+                    if (pairs.empty())
+                        continue;
+                    std::sort(pairs.begin(), pairs.end(), [](const KVPair &a, const KVPair &b)
+                              { return a.key < b.key; });
+                    std::vector<DataBlock *> blocks = build_blocks_from_pairs(pairs);
+                    if (!blocks.empty())
+                        publish_blocks(wid, blocks);
+                }
+            }
             continue;
+        }
 
         // group pairs by window_id
         std::unordered_map<uint64_t, std::vector<KVPair>> grouped;
         grouped.reserve(batch.size());
+
+        std::vector<uint64_t> grouped_wids;
+        grouped_wids.reserve(batch.size());
 
         for (auto &ps : batch)
         {
@@ -335,28 +518,30 @@ void SBTree::background_loop()
             if (!pairs.empty())
             {
                 auto &vec = grouped[ps.window_id];
-                // move pairs into grouped
                 vec.insert(vec.end(), pairs.begin(), pairs.end());
             }
+            grouped_wids.push_back(ps.window_id);
             delete ps.seg;
         }
 
-        // incorporate delayed_map_ entries for these windows (and optionally adjacent ones)
+        // dedupe grouped_wids
+        std::sort(grouped_wids.begin(), grouped_wids.end());
+        grouped_wids.erase(std::unique(grouped_wids.begin(), grouped_wids.end()), grouped_wids.end());
+
+        // incorporate delayed_map_ entries for these windows only
         {
             std::lock_guard<std::mutex> dl(delayed_mutex_);
-            for (auto &kv : delayed_map_)
+            for (uint64_t wid : grouped_wids)
             {
-                uint64_t wid = kv.first;
-                if (!kv.second.empty())
+                auto it = delayed_map_.find(wid);
+                if (it != delayed_map_.end() && !it->second.empty())
                 {
                     auto &vec = grouped[wid];
-                    vec.insert(vec.end(), kv.second.begin(), kv.second.end());
+                    vec.insert(vec.end(), it->second.begin(), it->second.end());
+                    // remove merged entries
+                    delayed_map_.erase(it);
                 }
             }
-            // clear delayed_map_ entirely because we merged all delayed entries into grouped.
-            // This is conservative: if delayed_map_ has windows that were not in grouped,
-            // we still merged them so they'll be published now.
-            delayed_map_.clear();
         }
 
         // sort window ids and publish in order
@@ -426,4 +611,46 @@ void SBTree::background_loop()
                 publish_blocks(wid, blocks);
         }
     }
+}
+
+// --- SearchNode helpers ---
+bool SBTree::sn_insert_block_(DataBlock *block)
+{
+    if (!block || !sn_root_)
+        return false;
+    // 简化：仅插入叶层，必要时在叶满时执行一次分裂并创建新根
+    if (sn_root_->InsertDataBlock(block->min_key(), block))
+        return true;
+
+    // 叶子满：分裂叶子并创建新根（简化版本）
+    std::unique_ptr<SearchNode> new_node;
+    Key split_key;
+    if (!sn_root_->Split(new_node, split_key))
+        return false;
+    // 创建新根并挂接两个子叶
+    auto new_root = std::make_unique<SearchNode>(SearchNode::NodeType::Internal, SN_FANOUT);
+    // 左子放在 children_[0]，右子放在 children_[1]，keys_[0] 为分裂键
+    new_root->InsertChild(split_key, std::move(new_node));
+    // 将原叶作为左子（需要将 sn_root_ 移到 new_root 的 children_[0]）
+    // 为简化，重新构造 children：先把当前旧叶作为第0子
+    // 这里用一种简单方式：先保存旧根指针，再重置 sn_root_
+    std::unique_ptr<SearchNode> old_leaf = std::move(sn_root_);
+    sn_root_ = std::move(new_root);
+    // children_: 插入顺序为 [old_leaf, right_leaf]，对应 keys_ 中 split_key
+    sn_root_->InsertChild(split_key, std::move(old_leaf));
+    // 再尝试把 block 插入（叶容量已扩展）
+    return sn_root_->InsertDataBlock(block->min_key(), block);
+}
+
+bool SBTree::sn_handle_split_(std::vector<SearchNode *> &path,
+                              std::size_t child_idx,
+                              std::unique_ptr<SearchNode> new_child,
+                              Key split_key)
+{
+    // 预留：当前简化实现暂不使用 path 回溯；后续扩展时填充。
+    (void)path;
+    (void)child_idx;
+    (void)new_child;
+    (void)split_key;
+    return false;
 }

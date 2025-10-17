@@ -4,6 +4,8 @@
 #include <vector>
 #include <limits>
 #include <utility>
+#include <mutex>
+#include <atomic>
 #include "KVPair.h"
 
 // -----------------------------------------------------------------------------
@@ -49,6 +51,15 @@ public:
     // 在 [start, end]（闭区间）范围内扫描，将命中 value 追加到 out；返回条数。
     size_t scan_range(Key start, Key end, std::vector<Value> &out) const;
 
+    // --- 写入（延迟数据落地用） ---
+    // 在保持块内有序的前提下插入一条记录；
+    // 若块已满则执行等分 split，将后半部分移至新块，并返回新块指针（通过 outNewRight）。
+    // 返回值：true 表示插入成功；false 表示失败（参数非法等）。
+    bool insert_sorted(Key k, Value v, DataBlock **outNewRight);
+
+    // 快速查询容量与满载状态
+    bool is_full() const { return count_ >= kCapacity; }
+
     // --- 访问器与链表链接 ---
     size_t size() const { return count_; }     // 当前条目数
     Key min_key() const { return min_key_; }   // 本块最小 key
@@ -89,6 +100,9 @@ private:
     void build_nary_();                                   // 依据 keys_ 构建 N-ary 表
     std::pair<size_t, size_t> bucket_range_(Key k) const; // 计算 key 所在桶的 [l,r)
 
+    // 分裂：将本块后半部分移动到新块，并维护链表与索引辅助结构
+    DataBlock *split_unsafe_();
+
     // ========================= 元数据字段 =========================
     Status status_ = Status::READY;                 // 块状态（预留）
     Key min_key_ = std::numeric_limits<Key>::max(); // 块内最小 key
@@ -96,6 +110,12 @@ private:
     DataBlock *next_ = nullptr;                     // 指向后继 DataBlock
     LockWord lock_ = 0;                             // 轻量锁（预留）
     uint32_t count_ = 0;                            // 实际填充条目数
+
+    // 写入期互斥，保护 insert_sorted/split_unsafe_ 的原子性
+    mutable std::mutex write_mutex_;
+
+    // 读写版本：偶数表示稳定，奇数表示写入中
+    mutable std::atomic<uint32_t> rw_version_{0};
 
     // ========================= 数据区 =========================
     Key nary_[kBuckets] = {};    // N-ary 搜索表（每桶的最小 key）

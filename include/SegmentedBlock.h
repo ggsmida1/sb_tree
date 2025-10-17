@@ -1,3 +1,4 @@
+// SegmentedBlock.h
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -41,8 +42,15 @@ public:
     }
   }
 
-  // 标记当前 SegmentedBlock 为“正在转换”状态
+  // 标记当前 SegmentedBlock 为“正在转换”状态（第一次调用返回 true）
   bool try_mark_converting();
+
+  // *** MODIFIED: 新增：读状态判断接口（非阻塞）
+  bool is_converting() const
+  {
+    const uint64_t CONVERT_BIT = (1ull << 63);
+    return (version_.load(std::memory_order_acquire) & CONVERT_BIT) != 0;
+  }
 
   size_t capacity() const { return capacity_; }
 

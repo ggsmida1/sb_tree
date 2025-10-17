@@ -1,3 +1,4 @@
+// SegmentedBlock.cpp
 #include "SegmentedBlock.h"
 #include "PerThreadDataBlock.h"
 #include <functional>
@@ -70,6 +71,7 @@ PerThreadDataBlock *SegmentedBlock::get_or_install_block_for_current_thread()
 }
 
 // 标记转换（避免重复）
+// *** MODIFIED: 注释强调该函数为 "first-wins" CAS 标记，后续调用返回 false。
 bool SegmentedBlock::try_mark_converting()
 {
   const uint64_t CONVERT_BIT = (1ull << 63);
@@ -79,3 +81,7 @@ bool SegmentedBlock::try_mark_converting()
   uint64_t desired = cur | CONVERT_BIT;
   return version_.compare_exchange_strong(cur, desired, std::memory_order_acq_rel);
 }
+
+// （可选增强）判断转换条件：至少半数 slot 满或存在延迟键
+// 说明：由于当前类未持有每线程块的满载状态与键范围，此函数应由上层 SBTree
+// 在收集统计后做判断；此处保留现状，实现位于 SBTree::insert 中。

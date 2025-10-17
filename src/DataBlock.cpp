@@ -1,4 +1,5 @@
 #include "DataBlock.h"
+#include <algorithm>
 
 // ========================= 构造 =========================
 DataBlock::DataBlock()
@@ -113,6 +114,102 @@ size_t DataBlock::scan_range(Key start, Key end, std::vector<Value> &out) const
         ++taken;
     }
     return taken;
+}
+
+// ========================= 写入（延迟数据） =========================
+bool DataBlock::insert_sorted(Key k, Value v, DataBlock **outNewRight)
+{
+    if (outNewRight)
+        *outNewRight = nullptr;
+
+    std::lock_guard<std::mutex> g(write_mutex_);
+
+    // 若已满，先分裂，再决定写入左或右
+    if (is_full())
+    {
+        DataBlock *right = split_unsafe_();
+        if (outNewRight)
+            *outNewRight = right;
+        // 决定目标块
+        if (k > max_key_ && right)
+        {
+            return right->insert_sorted(k, v, nullptr);
+        }
+        // 否则插入当前块
+    }
+
+    // 在当前块内二分定位插入位置
+    if (count_ == 0)
+    {
+        keys_[0] = k;
+        vals_[0] = v;
+        count_ = 1;
+        min_key_ = k;
+        max_key_ = k;
+        build_nary_();
+        return true;
+    }
+
+    size_t L = 0, R = count_;
+    while (L < R)
+    {
+        size_t mid = L + ((R - L) >> 1);
+        if (keys_[mid] < k)
+            L = mid + 1;
+        else
+            R = mid;
+    }
+    // L 为插入位置，将 [L..count_-1] 后移一位
+    if (count_ >= kCapacity)
+        return false; // 理论上前面已处理满载
+    for (size_t i = count_; i > L; --i)
+    {
+        keys_[i] = keys_[i - 1];
+        vals_[i] = vals_[i - 1];
+    }
+    keys_[L] = k;
+    vals_[L] = v;
+    ++count_;
+    if (k > max_key_)
+        max_key_ = k;
+    if (k < min_key_)
+        min_key_ = k;
+    build_nary_();
+    return true;
+}
+
+// 分裂：等分后半部分到新块，维护链表与索引
+DataBlock *DataBlock::split_unsafe_()
+{
+    if (count_ < 2)
+        return nullptr;
+    const size_t split_pos = count_ / 2;
+
+    DataBlock *right = new DataBlock();
+    // 将后半部分复制到右块
+    size_t rcount = count_ - split_pos;
+    for (size_t i = 0; i < rcount; ++i)
+    {
+        right->keys_[i] = keys_[split_pos + i];
+        right->vals_[i] = vals_[split_pos + i];
+    }
+    right->count_ = static_cast<uint32_t>(rcount);
+    right->min_key_ = right->keys_[0];
+    right->max_key_ = right->keys_[right->count_ - 1];
+
+    // 缩减本块为左半部分
+    count_ = static_cast<uint32_t>(split_pos);
+    min_key_ = keys_[0];
+    max_key_ = keys_[count_ - 1];
+
+    // 链接链表：right 继承原 next_
+    right->next_ = next_;
+    next_ = right;
+
+    // 重建 n-ary
+    build_nary_();
+    right->build_nary_();
+    return right;
 }
 
 // ========================= 内部辅助 =========================

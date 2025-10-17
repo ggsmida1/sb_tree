@@ -163,8 +163,13 @@ cmake ..
 # 步骤 4: 编译整个项目（包括核心库和测试程序）
 echo "正在编译项目..."
 cmake --build .
+make -j
 
 # 步骤 5: 运行编译好的测试程序
 echo "正在运行测试..."
 ./test/run_tests
 ./test/run_mt_test
+./test/run_batch_insert
+./test/run_basic_test
+./test/run_benchmark
+./test/run_functional

@@ -1,13 +1,16 @@
+// PerThreadDataBlock.cpp
 #include "PerThreadDataBlock.h"
 
 // ========================= 构造 =========================
 PerThreadDataBlock::PerThreadDataBlock()
-    : num_entries_(0), max_key_(0) {}
+    : num_entries_(0), max_key_(0), frozen_(false) {}
 
 // ========================= 写入接口 =========================
-// 尾部插入一条 KV。若已满返回 false。
+// 尾部插入一条 KV。若已满或已 freeze 返回 false。
 bool PerThreadDataBlock::Insert(Key key, Value value)
 {
+    if (frozen_)
+        return false; // 此块已被标记为不可写（conversion 正在进行或将要进行）
     if (IsFull())
         return false;
     data_[num_entries_] = {key, value};
@@ -33,4 +36,23 @@ size_t PerThreadDataBlock::GetNumEntries() const
 const KVPair *PerThreadDataBlock::GetData() const
 {
     return data_;
+}
+
+// ========================= 复用与统计 =========================
+void PerThreadDataBlock::Clear()
+{
+    num_entries_ = 0;
+    max_key_ = 0;
+    frozen_ = false;
+}
+
+Key PerThreadDataBlock::GetMinKey() const
+{
+    if (num_entries_ == 0)
+        return 0;
+    Key minv = data_[0].key;
+    for (size_t i = 1; i < num_entries_; ++i)
+        if (data_[i].key < minv)
+            minv = data_[i].key;
+    return minv;
 }

@@ -1,3 +1,4 @@
+// PerThreadDataBlock.h
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -27,7 +28,7 @@ public:
     PerThreadDataBlock(); // 初始化为空块（entries=0，max_key_ 置初值）
 
     // ========================= 追加写入接口 =========================
-    // 尾部追加一条 KV；若块已满则返回 false，不修改状态。
+    // 尾部追加一条 KV；若块已满或已 freeze 则返回 false，不修改状态。
     bool Insert(Key key, Value value);
     // 是否已满（num_entries_ == kCapacity）。
     bool IsFull() const;
@@ -37,6 +38,17 @@ public:
     size_t GetNumEntries() const;
     // 只读数据指针（首地址）。注意：仅在外部确保“写入已停止”前提下使用。
     const KVPair *GetData() const;
+
+    // ========================= Freeze 支持（*** MODIFIED: 新增） =========================
+    // Freeze 表示该缓冲区不再接受新的写入（用于 conversion 期间）
+    void Freeze() { frozen_ = true; }
+    bool IsFrozen() const { return frozen_; }
+
+    // ========================= 复用与统计（新增） =========================
+    // 清空内容，允许复用该块
+    void Clear();
+    // 计算当前最小 key（若为空返回 0 或调用方自行判断）
+    Key GetMinKey() const;
 
 private:
     // ========================= 常量与容量计算 =========================
@@ -50,6 +62,7 @@ private:
     // ========================= 元数据 =========================
     size_t num_entries_ = 0; // 已写入的条目数
     Key max_key_ = Key{};    // 到目前为止的最大 key（用于断言/范围估计）
+    bool frozen_ = false;    // *** MODIFIED: freeze 标志
 
     // ========================= 实际数据区 =========================
     KVPair data_[kCapacity]; // 顺序追加的 KV 存储
