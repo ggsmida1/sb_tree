@@ -10,6 +10,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# 允许在无外网环境下跳过第三方依赖的网络拉取
+option(ENABLE_NET_FETCH "Enable FetchContent network deps (googletest/benchmark)" OFF)
+
 # 定义 sb_tree 核心库
 add_library(sb_tree
     src/PerThreadDataBlock.cpp
@@ -22,24 +25,22 @@ add_library(sb_tree
 # 为 sb_tree 库及其使用者（PUBLIC）提供头文件路径
 target_include_directories(sb_tree PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# --- 后续内容保持不变 ---
 find_package(Threads REQUIRED)
 
-include(FetchContent)
-
-FetchContent_Declare(
-  googletest
-  URL "https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip"
-)
-
-FetchContent_Declare(
-  benchmark
-  GIT_REPOSITORY "https://github.com/google/benchmark.git"
-  GIT_TAG        "v1.8.0"
-)
-
-set(gtest_force_shared_crt OFF CACHE BOOL "Use shared CRT" FORCE)
-FetchContent_MakeAvailable(googletest benchmark)
+if(ENABLE_NET_FETCH)
+  include(FetchContent)
+  FetchContent_Declare(
+    googletest
+    URL "https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip"
+  )
+  FetchContent_Declare(
+    benchmark
+    GIT_REPOSITORY "https://github.com/google/benchmark.git"
+    GIT_TAG        "v1.8.0"
+  )
+  set(gtest_force_shared_crt OFF CACHE BOOL "Use shared CRT" FORCE)
+  FetchContent_MakeAvailable(googletest benchmark)
+endif()
 
 enable_testing()
 add_subdirectory(test)

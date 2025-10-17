@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <algorithm>
+#include <iterator>
 #include "KVPair.h"
 
 class DataBlock;
@@ -83,10 +85,13 @@ public:
         }
         else
         {
-            // Internal: 提取中间键作为分裂键
+            // Internal: 提取中间键作为分裂键，并移动后半部分孩子到新节点
             split_key = keys_[mid];
             new_node_out->keys_.assign(keys_.begin() + mid + 1, keys_.end());
-            new_node_out->children_.assign(children_.begin() + mid + 1, children_.end());
+            new_node_out->children_.insert(
+                new_node_out->children_.end(),
+                std::make_move_iterator(children_.begin() + mid + 1),
+                std::make_move_iterator(children_.end()));
             new_node_out->size_ = new_node_out->keys_.size();
 
             keys_.erase(keys_.begin() + mid, keys_.end());

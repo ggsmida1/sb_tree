@@ -49,7 +49,7 @@ void PerThreadDataBlock::Clear()
 Key PerThreadDataBlock::GetMinKey() const
 {
     if (num_entries_ == 0)
-        return 0;
+        return std::numeric_limits<Key>::max();
     Key minv = data_[0].key;
     for (size_t i = 1; i < num_entries_; ++i)
         if (data_[i].key < minv)

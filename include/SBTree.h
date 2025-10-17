@@ -36,6 +36,9 @@ public:
     std::size_t index_levels() const;
 
 private:
+    // determine whether key is delayed (historical/out-of-order)
+    bool IsDelayedData(Key k) const;
+
     // helpers
     DataBlock *find_candidate_(Key k) const;
 

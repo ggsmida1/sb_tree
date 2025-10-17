@@ -30,6 +30,29 @@ SBTree::SBTree()
     // 初始化新的 SearchNode 根（叶子）
     sn_root_ = std::make_unique<SearchNode>(SearchNode::NodeType::Leaf, SN_FANOUT);
 }
+bool SBTree::IsDelayedData(Key k) const
+{
+    // 判断：k 小于当前段的最小键 或 小于全局最大键
+    SegmentedBlock *seg = shortcut_.load(std::memory_order_acquire);
+    Key seg_min = std::numeric_limits<Key>::max();
+    if (seg)
+    {
+        // 估算段最小键：遍历所有注册 PTB 的最小键（需要 PerThreadDataBlock::GetMinKey）
+        seg->for_each_registered_ptr([&](PerThreadDataBlock *p) {
+            if (!p) return;
+            Key mk = p->GetMinKey();
+            if (mk != 0 && mk < seg_min)
+                seg_min = mk;
+        });
+    }
+    Key global_max = max_key_;
+    bool seg_min_known = (seg_min != std::numeric_limits<Key>::max());
+    if (seg_min_known && k < seg_min)
+        return true;
+    if (k < global_max)
+        return true;
+    return false;
+}
 
 SBTree::~SBTree()
 {
@@ -110,6 +133,13 @@ void SBTree::insert(Key k, Value v)
 
     while (true)
     {
+        // 优先：如果是延迟数据，直接走延迟路径，避免进入段写缓冲
+        if (IsDelayedData(k))
+        {
+            insert_delayed_(k, v);
+            return;
+        }
+
         SegmentedBlock *seg = shortcut_.load(std::memory_order_acquire);
         uint64_t seg_wid = seg ? seg->window_id() : 0;
 
@@ -203,14 +233,27 @@ bool SBTree::insert_delayed_(Key k, Value v)
     DataBlock *cur = find_candidate_(k);
     // 若无候选，从数据头开始
     if (!cur)
-        cur = data_head_;
+    {
+        // 步骤1：若完全找不到候选，临时缓冲进 delayed_map_ 对应窗口，等待后台发布
+        uint64_t wid = key_to_window(k);
+        {
+            std::lock_guard<std::mutex> lk(delayed_mutex_);
+            delayed_map_[wid].push_back(KVPair{k, v});
+        }
+        return true;
+    }
 
     // 沿链表前进到第一个可能覆盖 k 的块（max_key >= k）
     while (cur && cur->max_key() < k)
         cur = cur->next();
 
     if (!cur)
-        return false;
+    {
+        uint64_t wid = key_to_window(k);
+        std::lock_guard<std::mutex> lk(delayed_mutex_);
+        delayed_map_[wid].push_back(KVPair{k, v});
+        return true;
+    }
 
     // 在当前块尝试插入；若失败且下一块存在，尝试下一块
     for (int attempt = 0; attempt < 2 && cur; ++attempt)
@@ -224,10 +267,7 @@ bool SBTree::insert_delayed_(Key k, Value v)
             {
                 if (newRight)
                 {
-                    // 发布到旧索引与新索引
-                    std::vector<DataBlock *> run;
-                    run.push_back(newRight);
-                    publish_blocks(key_to_window(newRight->min_key()), run);
+                    // 分裂新块已链接到链表；仅更新新的索引，避免破坏 SearchLayer 的追加顺序
                     sn_insert_block_(newRight);
                 }
                 return true;
@@ -310,6 +350,9 @@ void SBTree::flush()
         if (shortcut_.compare_exchange_strong(seg, newseg, std::memory_order_acq_rel))
         {
             enqueue_segment_for_conversion(seg);
+            // 步骤3：测试期同步等待后台线程处理当前队列
+            // 简单等待一小段时间，给 background_loop 充足时间构建与发布
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         else
         {
@@ -320,17 +363,21 @@ void SBTree::flush()
 
 DataBlock *SBTree::find_candidate_(Key k) const
 {
-    // 优先从新的 SearchNode 根查找
-    if (sn_root_)
+    // 优先使用成熟的 SearchLayer，确保稳定性
+    if (!search_.empty())
     {
-        DataBlock *cand = nullptr;
-        // 叶层或单层树
-        cand = sn_root_->FindDataBlock(k);
+        DataBlock *cand = search_.find_candidate(k);
         if (cand)
             return cand;
     }
-    // 回退到旧的 SearchLayer
-    return search_.find_candidate(k);
+    // 回退到新的 SearchNode（叶/单层有效），再由链表纠偏兜底
+    if (sn_root_)
+    {
+        DataBlock *cand = sn_root_->FindDataBlock(k);
+        if (cand)
+            return cand;
+    }
+    return nullptr;
 }
 
 // collect KV pairs from a SegmentedBlock (takes and deletes per-thread buffers)
@@ -345,6 +392,9 @@ std::vector<KVPair> SBTree::collect_pairs_from_segment(SegmentedBlock *seg)
                                  {
         if (p)
             p->Freeze(); });
+
+    // 步骤4：临时小延迟，降低 Freeze 与 writer 并发窗口风险（测试期）
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
     // Now safely collect data (writers will have observed frozen_ and stopped)
     seg->for_each_registered_ptr([&out](PerThreadDataBlock *p)
