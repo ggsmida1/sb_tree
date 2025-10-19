@@ -77,44 +77,27 @@ void SegmentedBlock::UpdateKeyRange(uint64_t key) {
   }
 }
 
-bool SegmentedBlock::NeedConversion(uint64_t current_max_key) const {
-  // 转换条件（论文4.2节）：
-  // 1. 超过一半的PerThreadBlock满；2. 存在延迟数据
-  size_t full_count = 0;
-  bool has_delayed = false;
+bool SegmentedBlock::NeedConversion(uint64_t /*current_max_key*/) const {
+  // 论文：当任何一个每线程数据块满时就应触发转换
+  for (size_t i = 0; i < max_threads_; ++i) {
+    PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
+    if (pt_block && pt_block->IsFull()) {
+      return true;
+    }
+  }
+
+  // 可选：存在明显延迟数据也触发（最小键落在当前分段块范围左侧）
   const uint64_t seg_min = min_key_.load(std::memory_order_acquire);
-  
   for (size_t i = 0; i < max_threads_; ++i) {
     PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
     if (!pt_block) continue;
-    if (pt_block->IsFull()) {
-      full_count++;
-    }
     const uint64_t pt_min = pt_block->GetMinKey();
-    // 判断是否存在延迟数据：键小于分段块最小键
-    // 或者键明显小于当前全局最大键（避免无符号整数下溢）
-    if (pt_min != kInvalidKey) {
-      if (pt_min < seg_min) {
-        has_delayed = true;
-      } else if (current_max_key > 1000 && pt_min < current_max_key - 1000) {
-        has_delayed = true;
-      }
+    if (pt_min != kInvalidKey && seg_min != kInvalidKey && pt_min < seg_min) {
+      return true;
     }
   }
-  
-  // 论文要求：超过一半（大于等于）的块满，或存在延迟数据
-  // 添加迟滞：避免频繁转换，提高阈值，并加入冷却窗口
-  const size_t threshold = (max_threads_ * 3) / 4;  // 3/4 而非 1/2
-  const bool threshold_hit = (full_count >= threshold) || has_delayed;
-  if (!threshold_hit) return false;
-  const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count();
-  const uint64_t last = last_conversion_ns_.load(std::memory_order_acquire);
-  constexpr uint64_t kCooldownNs = 100000000; // 100ms
-  if (last != 0 && now - last < kCooldownNs) {
-    return false;
-  }
-  return true;
+
+  return false;
 }
 
 void SegmentedBlock::BeginWrite() {

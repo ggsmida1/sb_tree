@@ -115,6 +115,9 @@ void TestConcurrentInsert() {
         thread.join();
     }
     
+    // 等待转换器完成，确保所有数据都进入搜索层
+    tree.WaitForConverterIdle();
+    
     // 验证所有插入的数据都能正确查找
     for (int t = 0; t < num_threads; ++t) {
         for (uint64_t key : thread_keys[t]) {
@@ -145,6 +148,9 @@ void TestPerformance() {
     
     std::cout << "Inserted " << num_inserts << " items in " << duration.count() << " ms" << std::endl;
     std::cout << "Insert rate: " << (num_inserts * 1000.0 / duration.count()) << " ops/sec" << std::endl;
+    
+    // 等待转换器完成，确保所有数据都进入搜索层
+    tree.WaitForConverterIdle();
     
     // 测试查找性能
     start = std::chrono::high_resolution_clock::now();

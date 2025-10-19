@@ -27,35 +27,47 @@ int DataBlock::Insert(uint64_t key, uint64_t value, std::unique_ptr<DataBlock>* 
   } unlocker(version_);
 
   if (IsFull()) {
-    // 块满：尝试分裂（仅延迟数据插入时触发，引用1-120）
-    // 注意：split_mutex_ 在这里不需要了，因为我们已经有 write_mutex_
-    if (split_block) {
-      std::unique_ptr<DataBlock> new_block = Split();
-      
-      // 判断key应插入当前块还是新块
-      if (key <= keys_.back()) {
-        // 插入当前块（前半部分）
-        auto it = std::lower_bound(keys_.begin(), keys_.end(), key);
-        size_t pos = std::distance(keys_.begin(), it);
-        keys_.insert(it, key);
-        values_.insert(values_.begin() + pos, value);
-        size_++;
+    // 块满：执行分裂（仅延迟数据插入时触发，引用1-120）
+    if (!split_block) return -1;
+
+    // 分裂：当前块保留前半，新块返回给调用者
+    auto new_block = Split();
+    if (!new_block) return -1;
+
+    // 将当前插入路由到合适的块
+    if (size_ > 0 && key <= keys_.back()) {
+      // 插入当前块
+      auto it = std::lower_bound(keys_.begin(), keys_.end(), key);
+      size_t pos = std::distance(keys_.begin(), it);
+      keys_.insert(it, key);
+      values_.insert(values_.begin() + pos, value);
+      size_++;
+      // 降低N元表更新频率：仅在桶边界或桶数量变化时更新
+      const size_t old_buckets = search_table_.GetNumBuckets(size_ - 1);
+      const size_t new_buckets = search_table_.GetNumBuckets(size_);
+      const bool bucket_boundary = (pos % search_table_.GetBucketSize()) == 0 || pos == 0;
+      if (bucket_boundary || new_buckets != old_buckets) {
         search_table_.Update(keys_, size_);
-        *split_block = std::move(new_block);
-        return 0;
-      } else {
-        // 插入新块（后半部分）
-        // 释放当前块的锁，避免死锁
-        write_lock.unlock();
-        
-        if (new_block->Insert(key, value, nullptr) != 0) {
-          return -1;  // 新块也满（理论上不会发生）
-        }
-        *split_block = std::move(new_block);
-        return 1;
+      }
+    } else {
+      // 插入新块
+      auto& nb = new_block;
+      auto it = std::lower_bound(nb->keys_.begin(), nb->keys_.end(), key);
+      size_t pos = std::distance(nb->keys_.begin(), it);
+      nb->keys_.insert(it, key);
+      nb->values_.insert(nb->values_.begin() + pos, value);
+      nb->size_++;
+      const size_t old_buckets = nb->search_table_.GetNumBuckets(nb->size_ - 1);
+      const size_t new_buckets = nb->search_table_.GetNumBuckets(nb->size_);
+      const bool bucket_boundary = (pos % nb->search_table_.GetBucketSize()) == 0 || pos == 0;
+      if (bucket_boundary || new_buckets != old_buckets) {
+        nb->search_table_.Update(nb->keys_, nb->size_);
       }
     }
-    return -1;  // 块满但没有提供split_block参数
+
+    // 将新块所有权交给调用者
+    *split_block = std::move(new_block);
+    return 1;
   }
 
   // 正常插入：保持键有序（引用1-73）
@@ -83,6 +95,7 @@ std::unique_ptr<DataBlock> DataBlock::Split() {
   new_block->keys_.assign(keys_.begin() + split_pos, keys_.end());
   new_block->values_.assign(values_.begin() + split_pos, values_.end());
   new_block->size_ = size_ - split_pos;
+
   keys_.erase(keys_.begin() + split_pos, keys_.end());
   values_.erase(values_.begin() + split_pos, values_.end());
   size_ = split_pos;
@@ -91,10 +104,8 @@ std::unique_ptr<DataBlock> DataBlock::Split() {
   search_table_.Update(keys_, size_);
   new_block->search_table_.Update(new_block->keys_, new_block->size_);
 
-  // 链接新块（当前块的next指向新块，新块继承当前块的next）
-  new_block->SetNextBlock(std::move(next_block_));
-  next_block_ = std::move(new_block);
-  return std::move(next_block_);  // 返回新块（所有权转移）
+  // 注意：不在此处改动 next_block_，由调用者决定如何挂链
+  return new_block;
 }
 
 void DataBlock::BulkFill(const std::vector<KeyValuePair>& kv, size_t start_idx, size_t end_idx) {

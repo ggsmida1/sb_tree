@@ -54,4 +54,28 @@ class SegmentedBlock {
   alignas(64) std::atomic<uint64_t> last_conversion_ns_{0};        // 上次转换触发时间（ns）
 };
 
+/// 写者作用域守卫：构造BeginWrite，析构EndWrite，确保成对调用
+class ScopedSegmentWrite {
+ public:
+  explicit ScopedSegmentWrite(SegmentedBlock* seg) : seg_(seg) {
+    if (seg_) seg_->BeginWrite();
+  }
+  ~ScopedSegmentWrite() {
+    if (seg_) seg_->EndWrite();
+  }
+  ScopedSegmentWrite(const ScopedSegmentWrite&) = delete;
+  ScopedSegmentWrite& operator=(const ScopedSegmentWrite&) = delete;
+  ScopedSegmentWrite(ScopedSegmentWrite&& other) noexcept : seg_(other.seg_) { other.seg_ = nullptr; }
+  ScopedSegmentWrite& operator=(ScopedSegmentWrite&& other) noexcept {
+    if (this != &other) {
+      if (seg_) seg_->EndWrite();
+      seg_ = other.seg_;
+      other.seg_ = nullptr;
+    }
+    return *this;
+  }
+ private:
+  SegmentedBlock* seg_;
+};
+
 #endif  // SEGMENTED_BLOCK_H_

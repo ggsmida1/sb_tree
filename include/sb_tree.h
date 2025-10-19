@@ -30,6 +30,8 @@ class SBTree {
 
   /// 供转换线程调用：更新搜索层（论文4.3节，引用1-119）
   void UpdateSearchLayerWithDataBlocks(std::vector<std::unique_ptr<DataBlock>> data_blocks);
+  /// 供转换线程调用：将单个数据块（非拥有）插入搜索层索引
+  void IndexDataBlockNonOwning(DataBlock* data_block);
 
   BlockAllocator* GetAllocator() { return &allocator_; }
   uint64_t GetCurrentMaxKey() const { return current_max_key_.load(std::memory_order_acquire); }

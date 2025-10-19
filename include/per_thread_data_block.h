@@ -33,13 +33,6 @@ class PerThreadDataBlock {
  private:
   std::vector<KeyValuePair> kv_pairs_;  // 无序存储（转换时排序，引用1-108）
   BlockAllocator* allocator_;           // 块分配器
-  mutable std::atomic_flag write_lock_ = ATOMIC_FLAG_INIT; // 轻量自旋锁
-  void Lock() const {
-    while (write_lock_.test_and_set(std::memory_order_acquire)) {}
-  }
-  void Unlock() const {
-    write_lock_.clear(std::memory_order_release);
-  }
 };
 
 #endif  // PER_THREAD_DATA_BLOCK_H_
