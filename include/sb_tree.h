@@ -58,11 +58,11 @@ class SBTree {
 
   // 核心组件
   std::unique_ptr<SearchNode> root_;                          // 搜索层根节点（引用1-67）
-  std::unique_ptr<SegmentedBlock> current_segmented_block_;   // 当前活跃分段块（引用1-65）
+  std::atomic<SegmentedBlock*> current_segmented_block_;      // 当前活跃分段块（原子指针，引用P0）
   BlockAllocator allocator_;                                  // 块分配器（引用1-89）
   SegmentedBlockConverter converter_;                         // 分段块转换器（引用1-107）
   std::atomic<uint64_t> current_max_key_;                     // 当前全局最大键（原子更新）
-  mutable std::mutex segmented_block_mutex_;                  // 分段块切换锁（引用1-107）
+  mutable std::mutex segmented_block_mutex_;                  // 分段块切换锁（不再用于fast-path）
   mutable std::mutex search_layer_write_mutex_;               // 搜索层写锁（ROWEX：单写线程，引用1-92）
 };
 

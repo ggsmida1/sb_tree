@@ -1,6 +1,7 @@
 #include "segmented_block.h"
 #include "block_allocator.h"
 #include <algorithm>
+#include <thread>
 
 // -----------------------------------------------------------------------------
 // SegmentedBlock 实现（论文3.3节，引用1-71、1-105）
@@ -10,7 +11,20 @@ SegmentedBlock::SegmentedBlock(size_t max_threads, BlockAllocator* allocator)
       allocator_(allocator),
       min_key_(kInvalidKey),
       max_key_(0) {
-  per_thread_blocks_.resize(max_threads);
+  per_thread_blocks_ = std::make_unique<std::atomic<PerThreadDataBlock*>[]>(max_threads_);
+  for (size_t i = 0; i < max_threads_; ++i) {
+    per_thread_blocks_[i].store(nullptr, std::memory_order_relaxed);
+  }
+}
+
+SegmentedBlock::~SegmentedBlock() {
+  for (size_t i = 0; i < max_threads_; ++i) {
+    PerThreadDataBlock* ptr = per_thread_blocks_[i].load(std::memory_order_acquire);
+    if (ptr) {
+      delete ptr;
+      per_thread_blocks_[i].store(nullptr, std::memory_order_release);
+    }
+  }
 }
 
 PerThreadDataBlock* SegmentedBlock::AllocatePerThreadBlock(size_t thread_id) {
@@ -18,16 +32,26 @@ PerThreadDataBlock* SegmentedBlock::AllocatePerThreadBlock(size_t thread_id) {
     return nullptr;
   }
   
-  // 如果已经存在，直接返回
-  if (per_thread_blocks_[thread_id]) {
-    return per_thread_blocks_[thread_id].get();
-  }
+  PerThreadDataBlock* existing = per_thread_blocks_[thread_id].load(std::memory_order_acquire);
+  if (existing) return existing;
   
-  // 创建新的PerThreadBlock
-  auto pt_block = std::make_unique<PerThreadDataBlock>(allocator_);
-  PerThreadDataBlock* ptr = pt_block.get();
-  per_thread_blocks_[thread_id] = std::move(pt_block);
-  return ptr;
+  PerThreadDataBlock* created = new PerThreadDataBlock(allocator_);
+  if (per_thread_blocks_[thread_id].compare_exchange_strong(existing, created, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return created;
+  }
+  // 其他线程已放入
+  delete created;
+  return existing;
+}
+
+PerThreadDataBlock* SegmentedBlock::LoadPerThreadBlock(size_t thread_id) const {
+  if (thread_id >= max_threads_) return nullptr;
+  return per_thread_blocks_[thread_id].load(std::memory_order_acquire);
+}
+
+PerThreadDataBlock* SegmentedBlock::StealPerThreadBlock(size_t thread_id) {
+  if (thread_id >= max_threads_) return nullptr;
+  return per_thread_blocks_[thread_id].exchange(nullptr, std::memory_order_acq_rel);
 }
 
 void SegmentedBlock::UpdateKeyRange(uint64_t key) {
@@ -57,10 +81,10 @@ bool SegmentedBlock::NeedConversion(uint64_t current_max_key) const {
   // 1. 超过一半的PerThreadBlock满；2. 存在延迟数据
   size_t full_count = 0;
   bool has_delayed = false;
-  const auto& pt_blocks = GetAllPerThreadBlocks();
   const uint64_t seg_min = min_key_.load(std::memory_order_acquire);
   
-  for (const auto& pt_block : pt_blocks) {
+  for (size_t i = 0; i < max_threads_; ++i) {
+    PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
     if (!pt_block) continue;
     if (pt_block->IsFull()) {
       full_count++;
@@ -79,4 +103,19 @@ bool SegmentedBlock::NeedConversion(uint64_t current_max_key) const {
   
   // 论文要求：超过一半（大于等于）的块满，或存在延迟数据
   return (full_count >= (max_threads_ + 1) / 2) || has_delayed;
+}
+
+void SegmentedBlock::BeginWrite() {
+  active_writers_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void SegmentedBlock::EndWrite() {
+  active_writers_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void SegmentedBlock::WaitForQuiescent() const {
+  // 等待没有活跃写者
+  while (active_writers_.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
 }

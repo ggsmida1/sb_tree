@@ -5,6 +5,7 @@
 #include "data_block.h"
 #include <algorithm>
 #include <functional>
+#include <thread>
 
 // -----------------------------------------------------------------------------
 // SegmentedBlockConverter 实现（论文4.2节，引用1-107、1-108）
@@ -49,13 +50,18 @@ void SegmentedBlockConverter::ConversionThreadMain() {
 
     if (!task) continue;
 
+    // 等待旧分段块上无活跃写者，确保安全抓取
+    task->WaitForQuiescent();
+
     // 1. 合并所有PerThreadBlock的KV对（引用1-108）
     std::vector<KeyValuePair> merged_kv;
-    const auto& pt_blocks = task->GetAllPerThreadBlocks();
-    for (const auto& pt_block : pt_blocks) {
+    for (size_t i = 0; i < task->GetMaxThreads(); ++i) {
+      PerThreadDataBlock* pt_block = task->StealPerThreadBlock(i);
       if (!pt_block) continue;
       const auto& kv_list = pt_block->GetAllKv();
       merged_kv.insert(merged_kv.end(), kv_list.begin(), kv_list.end());
+      // 延迟释放：避免极短时间窗口与写入竞争
+      delete pt_block;
     }
     if (merged_kv.empty()) continue;
 
