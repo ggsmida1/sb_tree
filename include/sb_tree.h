@@ -31,6 +31,9 @@ class SBTree {
   BlockAllocator* GetAllocator() { return &allocator_; }
   uint64_t GetCurrentMaxKey() const { return current_max_key_.load(std::memory_order_acquire); }
 
+  /// 在当前分段块中查找键值（用于查找未转换的新数据）
+  bool LookupInSegmentedBlock(uint64_t key, uint64_t* out_value) const;
+
  private:
   /// 判断是否为延迟数据（论文4.4节：key < 当前分段块最小键 或 key < 当前全局最大键）
   bool IsDelayedData(uint64_t key) const;
@@ -40,6 +43,12 @@ class SBTree {
 
   /// 搜索层插入数据块（支持节点分裂，自底向上更新，引用1-67）
   bool InsertDataBlockToSearchLayer(DataBlock* data_block);
+
+  /// 搜索层递归插入数据块（支持内部节点和叶子节点）
+  bool InsertDataBlockToSearchLayerRecursive(SearchNode* node, uint64_t key, DataBlock* data_block);
+
+  /// 收集搜索层所有叶子节点中的数据块（用于延迟数据插入）
+  void CollectAllDataBlocks(SearchNode* node, std::vector<DataBlock*>* result) const;
 
   /// 搜索层节点分裂处理（递归更新父节点，引用1-67）
   bool HandleSearchNodeSplit(std::unique_ptr<SearchNode>* parent_node, 
@@ -53,8 +62,8 @@ class SBTree {
   BlockAllocator allocator_;                                  // 块分配器（引用1-89）
   SegmentedBlockConverter converter_;                         // 分段块转换器（引用1-107）
   std::atomic<uint64_t> current_max_key_;                     // 当前全局最大键（原子更新）
-  std::mutex segmented_block_mutex_;                          // 分段块切换锁（引用1-107）
-  std::mutex search_layer_write_mutex_;                       // 搜索层写锁（ROWEX：单写线程，引用1-92）
+  mutable std::mutex segmented_block_mutex_;                  // 分段块切换锁（引用1-107）
+  mutable std::mutex search_layer_write_mutex_;               // 搜索层写锁（ROWEX：单写线程，引用1-92）
 };
 
 #endif  // SB_TREE_H_

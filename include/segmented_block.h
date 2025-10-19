@@ -22,6 +22,9 @@ class SegmentedBlock {
     return per_thread_blocks_;
   }
 
+  /// 更新分段块的键范围（在插入时调用）
+  void UpdateKeyRange(uint64_t key);
+
   /// 精准判断是否需要转换（论文4.2节：块满数量达标+存在键溢出）
   /// @param current_max_key 当前全局最大键
   bool NeedConversion(uint64_t current_max_key) const;

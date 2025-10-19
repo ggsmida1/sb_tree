@@ -22,7 +22,9 @@ bool SearchNode::InsertDataBlock(uint64_t min_key, DataBlock* data_block) {
   if (type_ != kLeafNode) {
     return false;
   }
-  std::lock_guard<std::mutex> lock(write_mutex_);  // ROWEX：写线程独占锁（引用1-92）
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);  // 独占写锁
+  std::lock_guard<std::mutex> write_lock(write_mutex_);  // 额外的写锁保护
+  
   if (IsFull()) {
     return false;  // 需分裂，上层处理
   }
@@ -40,7 +42,9 @@ bool SearchNode::InsertChild(uint64_t max_key, std::unique_ptr<SearchNode> child
   if (type_ != kInternalNode) {
     return false;
   }
-  std::lock_guard<std::mutex> lock(write_mutex_);
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);  // 独占写锁
+  std::lock_guard<std::mutex> write_lock(write_mutex_);  // 额外的写锁保护
+  
   if (IsFull()) {
     return false;  // 需分裂
   }
@@ -58,7 +62,9 @@ bool SearchNode::Split(std::unique_ptr<SearchNode>* new_node, uint64_t* split_ke
   if (!IsFull() || new_node == nullptr || split_key == nullptr) {
     return false;
   }
-  std::lock_guard<std::mutex> lock(write_mutex_);
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);  // 独占写锁
+  std::lock_guard<std::mutex> write_lock(write_mutex_);  // 额外的写锁保护
+  
   if (!IsFull()) {
     return false;
   }
@@ -101,12 +107,21 @@ DataBlock* SearchNode::FindDataBlock(uint64_t key) const {
   if (type_ != kLeafNode) {
     return nullptr;
   }
-  // 读无锁（ROWEX：读线程无需加锁，引用1-92）
+  // 使用共享读锁保护（ROWEX改进：多读单写，引用1-92）
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  
+  if (keys_.empty()) {
+    return nullptr;
+  }
+  
   auto it = std::upper_bound(keys_.begin(), keys_.end(), key);
   if (it == keys_.begin()) {
     return nullptr;
   }
   const size_t pos = std::distance(keys_.begin(), it) - 1;
+  if (pos >= data_blocks_.size()) {
+    return nullptr;
+  }
   return data_blocks_[pos];
 }
 
@@ -114,7 +129,13 @@ SearchNode* SearchNode::FindChild(uint64_t key) const {
   if (type_ != kInternalNode) {
     return nullptr;
   }
-  // 读无锁（引用1-92）
+  // 使用共享读锁保护（ROWEX改进：多读单写，引用1-92）
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  
+  if (keys_.empty()) {
+    return nullptr;
+  }
+  
   auto it = std::upper_bound(keys_.begin(), keys_.end(), key);
   const size_t pos = std::distance(keys_.begin(), it);
   if (pos >= children_.size()) {

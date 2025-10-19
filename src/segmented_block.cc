@@ -30,21 +30,53 @@ PerThreadDataBlock* SegmentedBlock::AllocatePerThreadBlock(size_t thread_id) {
   return ptr;
 }
 
+void SegmentedBlock::UpdateKeyRange(uint64_t key) {
+  // 原子更新最小键
+  uint64_t current_min = min_key_.load(std::memory_order_acquire);
+  while (current_min == kInvalidKey || key < current_min) {
+    if (min_key_.compare_exchange_weak(current_min, key, 
+                                       std::memory_order_acq_rel, 
+                                       std::memory_order_acquire)) {
+      break;
+    }
+  }
+  
+  // 原子更新最大键
+  uint64_t current_max = max_key_.load(std::memory_order_acquire);
+  while (key > current_max) {
+    if (max_key_.compare_exchange_weak(current_max, key, 
+                                       std::memory_order_acq_rel, 
+                                       std::memory_order_acquire)) {
+      break;
+    }
+  }
+}
+
 bool SegmentedBlock::NeedConversion(uint64_t current_max_key) const {
   // 转换条件（论文4.2节）：
-  // 1. 超过一半的PerThreadBlock满；2. 存在键小于当前全局最大键（延迟数据）
+  // 1. 超过一半的PerThreadBlock满；2. 存在延迟数据
   size_t full_count = 0;
   bool has_delayed = false;
   const auto& pt_blocks = GetAllPerThreadBlocks();
+  const uint64_t seg_min = min_key_.load(std::memory_order_acquire);
+  
   for (const auto& pt_block : pt_blocks) {
     if (!pt_block) continue;
     if (pt_block->IsFull()) {
       full_count++;
     }
     const uint64_t pt_min = pt_block->GetMinKey();
-    if (pt_min != kInvalidKey && pt_min < current_max_key) {
-      has_delayed = true;
+    // 判断是否存在延迟数据：键小于分段块最小键
+    // 或者键明显小于当前全局最大键（避免无符号整数下溢）
+    if (pt_min != kInvalidKey) {
+      if (pt_min < seg_min) {
+        has_delayed = true;
+      } else if (current_max_key > 1000 && pt_min < current_max_key - 1000) {
+        has_delayed = true;
+      }
     }
   }
-  return (full_count > max_threads_ / 2) || has_delayed;
+  
+  // 论文要求：超过一半（大于等于）的块满，或存在延迟数据
+  return (full_count >= (max_threads_ + 1) / 2) || has_delayed;
 }

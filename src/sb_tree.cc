@@ -29,11 +29,23 @@ SBTree::~SBTree() {
 
 bool SBTree::IsDelayedData(uint64_t key) const {
   // 延迟数据判断（论文4.4节）：
-  // 1. key < 当前分段块的最小键；2. key < 当前全局最大键（排除新数据）
+  // 1. key < 当前分段块的最小键；2. key明显小于当前全局最大键
   const uint64_t seg_min = current_segmented_block_->GetMinKey();
   const uint64_t global_max = current_max_key_.load(std::memory_order_acquire);
-  // 简化判断：只有当key明显小于当前最大键时才认为是延迟数据
-  return (global_max > 0 && key < global_max - 1000);  // 给一个缓冲区间
+  
+  // 如果分段块已有数据且key小于最小键，则为延迟数据
+  if (seg_min != kInvalidKey && key < seg_min) {
+    return true;
+  }
+  
+  // 如果key明显小于全局最大键，则为延迟数据（使用分段块最小键作为参考）
+  if (global_max > 0 && seg_min != kInvalidKey) {
+    // 使用分段块最小键而非硬编码的1000
+    const uint64_t threshold = (global_max > seg_min) ? seg_min : (global_max - 1000);
+    return key < threshold;
+  }
+  
+  return false;
 }
 
 bool SBTree::Insert(uint64_t key, uint64_t value) {
@@ -50,98 +62,131 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
   }
 
   // 2. 非延迟数据：通过shortcut插入分段块（引用1-69）
-  std::unique_lock<std::mutex> seg_lock(segmented_block_mutex_, std::try_to_lock);
-  if (!seg_lock.owns_lock()) {
-    // 分段块切换中，重试（短期阻塞）
-    std::this_thread::yield();
-    return Insert(key, value);
-  }
-
-  // 获取当前线程的PerThreadBlock（引用1-71）
-  const size_t thread_id = std::hash<std::thread::id>{}(std::this_thread::get_id()) % 
-                          kSegmentedBlockMaxThreads;
-  PerThreadDataBlock* pt_block = current_segmented_block_->AllocatePerThreadBlock(thread_id);
-  if (!pt_block) {
-    // 线程已分配块，直接获取
-    const auto& pt_blocks = current_segmented_block_->GetAllPerThreadBlocks();
-    if (thread_id < pt_blocks.size() && pt_blocks[thread_id]) {
-      pt_block = pt_blocks[thread_id].get();
+  // 使用循环替代递归重试，避免栈溢出
+  const int max_retries = 10;
+  for (int retry = 0; retry < max_retries; ++retry) {
+    std::unique_lock<std::mutex> seg_lock(segmented_block_mutex_, std::try_to_lock);
+    if (!seg_lock.owns_lock()) {
+      // 分段块切换中，短暂等待后重试
+      std::this_thread::yield();
+      continue;
     }
+
+    // 获取当前线程的PerThreadBlock（引用1-71）
+    const size_t thread_id = std::hash<std::thread::id>{}(std::this_thread::get_id()) % 
+                            kSegmentedBlockMaxThreads;
+    PerThreadDataBlock* pt_block = current_segmented_block_->AllocatePerThreadBlock(thread_id);
     if (!pt_block) {
-      return false;
+      // 线程已分配块，直接获取
+      const auto& pt_blocks = current_segmented_block_->GetAllPerThreadBlocks();
+      if (thread_id < pt_blocks.size() && pt_blocks[thread_id]) {
+        pt_block = pt_blocks[thread_id].get();
+      }
+      if (!pt_block) {
+        return false;
+      }
     }
-  }
 
-  // 3. 插入PerThreadBlock（引用1-103）
-  if (pt_block->Insert(key, value)) {
-    // 4. 检查分段块是否需要转换（引用1-105）
-    if (current_segmented_block_->NeedConversion(current_max_key_)) {
-      // 创建新分段块替换当前（引用1-107）
-      auto new_seg_block = std::make_unique<SegmentedBlock>(kSegmentedBlockMaxThreads, &allocator_);
-      auto old_seg_block = std::move(current_segmented_block_);
-      current_segmented_block_ = std::move(new_seg_block);
-      // 提交转换任务（异步，引用1-107）
-      converter_.SubmitConversionTask(std::move(old_seg_block));
+    // 3. 插入PerThreadBlock（引用1-103）
+    if (pt_block->Insert(key, value)) {
+      // 更新分段块的键范围
+      current_segmented_block_->UpdateKeyRange(key);
+      
+      // 4. 检查分段块是否需要转换（引用1-105）
+      if (current_segmented_block_->NeedConversion(current_max_key_)) {
+        // 创建新分段块替换当前（引用1-107）
+        auto new_seg_block = std::make_unique<SegmentedBlock>(kSegmentedBlockMaxThreads, &allocator_);
+        auto old_seg_block = std::move(current_segmented_block_);
+        current_segmented_block_ = std::move(new_seg_block);
+        // 提交转换任务（异步，引用1-107）
+        converter_.SubmitConversionTask(std::move(old_seg_block));
+      }
+      return true;
     }
-    return true;
-  }
 
-  // 5. PerThreadBlock满：提交转换任务并重试（引用1-105）
-  auto new_seg_block = std::make_unique<SegmentedBlock>(kSegmentedBlockMaxThreads, &allocator_);
-  auto old_seg_block = std::move(current_segmented_block_);
-  current_segmented_block_ = std::move(new_seg_block);
-  converter_.SubmitConversionTask(std::move(old_seg_block));
-  return Insert(key, value);  // 重试插入新分段块
+    // 5. PerThreadBlock满：提交转换任务并在下次循环中重试（引用1-105）
+    auto new_seg_block = std::make_unique<SegmentedBlock>(kSegmentedBlockMaxThreads, &allocator_);
+    auto old_seg_block = std::move(current_segmented_block_);
+    current_segmented_block_ = std::move(new_seg_block);
+    converter_.SubmitConversionTask(std::move(old_seg_block));
+    // 继续循环，重试插入新分段块
+  }
+  
+  // 重试次数耗尽，返回失败
+  return false;
 }
 
 bool SBTree::InsertDelayedData(uint64_t key, uint64_t value) {
   // 1. 遍历搜索层找目标数据块（引用1-120）
   SearchNode* current_node = root_.get();
-  while (current_node->GetType() != SearchNode::kLeafNode) {
+  while (current_node && current_node->GetType() != SearchNode::kLeafNode) {
     current_node = current_node->FindChild(key);
-    if (!current_node) {
-      break;  // 搜索层未找到，遍历数据层
-    }
   }
 
-  // 2. 遍历数据层找目标块（引用1-120）
+  // 2. 在搜索层叶子节点中查找目标数据块
   DataBlock* target_block = nullptr;
   if (current_node) {
     target_block = current_node->FindDataBlock(key);
   }
+  
+  // 3. 如果搜索层未找到，遍历数据层链表（支持多级搜索层）
   if (!target_block) {
-    // 搜索层未找到，从数据层头部开始遍历（链表）
-    // 注：实际需维护数据层头部指针，此处简化为从搜索层根节点叶子块开始
-    if (root_->GetType() == SearchNode::kLeafNode) {
-      const auto& data_blocks = root_->GetDataBlocks();
-      if (!data_blocks.empty()) {
-        DataBlock* curr = data_blocks[0];
-        while (curr) {
-          if (key >= curr->GetMinKey() && key <= curr->GetMaxKey()) {
-            target_block = curr;
-            break;
-          }
-          curr = curr->GetNextBlock().get();
+    // 收集所有叶子节点中的数据块
+    std::vector<DataBlock*> all_data_blocks;
+    CollectAllDataBlocks(root_.get(), &all_data_blocks);
+    
+    // 遍历数据块链表
+    for (DataBlock* db : all_data_blocks) {
+      DataBlock* curr = db;
+      while (curr) {
+        if (key >= curr->GetMinKey() && key <= curr->GetMaxKey()) {
+          target_block = curr;
+          break;
         }
+        curr = curr->GetNextBlock().get();
+      }
+      if (target_block) {
+        break;
       }
     }
   }
+  
   if (!target_block) {
     return false;  // 未找到目标块（数据不存在）
   }
 
-  // 3. 插入延迟数据（可能触发块分裂，引用1-120）
+  // 4. 插入延迟数据（可能触发块分裂，引用1-120）
   std::unique_ptr<DataBlock> split_block;
   const int insert_res = target_block->Insert(key, value, &split_block);
   if (insert_res == -1) {
     return false;
   }
 
-  // 4. 若分裂，将新块插入搜索层（引用1-120）
+  // 5. 若分裂，将新块插入搜索层（引用1-120）
   if (split_block && insert_res == 1) {
     return InsertDataBlockToSearchLayer(split_block.release());
   }
   return true;
+}
+
+void SBTree::CollectAllDataBlocks(SearchNode* node, std::vector<DataBlock*>* result) const {
+  if (!node || !result) {
+    return;
+  }
+  
+  if (node->GetType() == SearchNode::kLeafNode) {
+    // 叶子节点：收集所有数据块
+    const auto& data_blocks = node->GetDataBlocks();
+    for (DataBlock* db : data_blocks) {
+      result->push_back(db);
+    }
+  } else {
+    // 内部节点：递归收集所有子节点的数据块
+    const auto& children = node->GetChildren();
+    for (const auto& child : children) {
+      CollectAllDataBlocks(child.get(), result);
+    }
+  }
 }
 
 bool SBTree::InsertDataBlockToSearchLayer(DataBlock* data_block) {
@@ -150,13 +195,15 @@ bool SBTree::InsertDataBlockToSearchLayer(DataBlock* data_block) {
   }
   std::lock_guard<std::mutex> lock(search_layer_write_mutex_);  // ROWEX：单写线程（引用1-92）
 
-  // 简化实现：直接插入到根节点（如果是叶子节点）
+  uint64_t insert_key = data_block->GetMinKey();
+  
+  // 如果根节点是叶子节点，直接处理
   if (root_->GetType() == SearchNode::kLeafNode) {
-    if (root_->InsertDataBlock(data_block->GetMinKey(), data_block)) {
+    if (root_->InsertDataBlock(insert_key, data_block)) {
       return true;
     }
     
-    // 根节点满，分裂
+    // 根节点满，需要分裂
     std::unique_ptr<SearchNode> new_node;
     uint64_t split_key;
     if (!root_->Split(&new_node, &split_key)) {
@@ -169,12 +216,58 @@ bool SBTree::InsertDataBlockToSearchLayer(DataBlock* data_block) {
     new_root->InsertChild(new_node->GetMaxKey(), std::move(new_node));
     root_ = std::move(new_root);
     
-    // 重新尝试插入
-    return root_->InsertDataBlock(data_block->GetMinKey(), data_block);
+    // 重新尝试插入到新的树结构
+    return InsertDataBlockToSearchLayerRecursive(root_.get(), insert_key, data_block);
   }
   
-  // 内部节点：简化处理，直接插入到最右侧
-  // 这里需要更复杂的实现，暂时返回false
+  // 内部节点：递归插入
+  return InsertDataBlockToSearchLayerRecursive(root_.get(), insert_key, data_block);
+}
+
+bool SBTree::InsertDataBlockToSearchLayerRecursive(SearchNode* node, uint64_t key, DataBlock* data_block) {
+  if (!node || !data_block) {
+    return false;
+  }
+  
+  // 如果是叶子节点，直接插入数据块
+  if (node->GetType() == SearchNode::kLeafNode) {
+    if (node->InsertDataBlock(key, data_block)) {
+      return true;
+    }
+    // 叶子节点满了，返回false表示需要父节点处理分裂
+    return false;
+  }
+  
+  // 内部节点：找到目标子节点
+  SearchNode* child = node->FindChild(key);
+  if (!child) {
+    // 如果找不到合适的子节点，插入到第一个子节点（最左侧）
+    const auto& children = node->GetChildren();
+    if (children.empty()) {
+      return false;
+    }
+    child = children[0].get();
+  }
+  
+  // 递归插入到子节点
+  if (InsertDataBlockToSearchLayerRecursive(child, key, data_block)) {
+    return true;
+  }
+  
+  // 子节点满了，需要分裂
+  std::unique_ptr<SearchNode> new_child_node;
+  uint64_t split_key;
+  if (!child->Split(&new_child_node, &split_key)) {
+    return false;
+  }
+  
+  // 将分裂出的新节点插入到当前节点
+  if (node->InsertChild(new_child_node->GetMaxKey(), std::move(new_child_node))) {
+    // 成功插入新子节点，重试原始插入
+    return InsertDataBlockToSearchLayerRecursive(node, key, data_block);
+  }
+  
+  // 当前节点也满了，返回false让上层处理
   return false;
 }
 
@@ -208,35 +301,61 @@ void SBTree::UpdateSearchLayerWithDataBlocks(std::vector<std::unique_ptr<DataBlo
   InsertDataBlockToSearchLayer(data_blocks[0].release());
 }
 
-const uint64_t* SBTree::Lookup(uint64_t key) const {
-  // 1. 遍历搜索层找数据块（引用1-124）
-  SearchNode* current_node = root_.get();
-  while (current_node->GetType() != SearchNode::kLeafNode) {
-    current_node = current_node->FindChild(key);
-    if (!current_node) {
-      return nullptr;
-    }
-  }
-
-  // 2. 数据块内查找（引用1-124）
-  DataBlock* data_block = current_node->FindDataBlock(key);
-  if (!data_block) {
-    // 搜索层未找到，遍历数据层（引用1-119）
-    if (root_->GetType() == SearchNode::kLeafNode) {
-      const auto& data_blocks = root_->GetDataBlocks();
-      for (DataBlock* db : data_blocks) {
-        if (db->GetMinKey() <= key && key <= db->GetMaxKey()) {
-          data_block = db;
-          break;
-        }
+bool SBTree::LookupInSegmentedBlock(uint64_t key, uint64_t* out_value) const {
+  // 使用阻塞锁，确保能读取到最新数据
+  std::lock_guard<std::mutex> seg_lock(segmented_block_mutex_);
+  
+  const auto& pt_blocks = current_segmented_block_->GetAllPerThreadBlocks();
+  for (const auto& pt_block : pt_blocks) {
+    if (!pt_block) continue;
+    const auto& kv_pairs = pt_block->GetAllKv();
+    for (const auto& kv : kv_pairs) {
+      if (kv.key == key) {
+        *out_value = kv.value;
+        return true;
       }
     }
+  }
+  return false;
+}
+
+const uint64_t* SBTree::Lookup(uint64_t key) const {
+  // 1. 首先检查当前分段块中的 PerThreadBlock（最新数据可能还未转换）
+  static thread_local uint64_t thread_local_value;
+  if (LookupInSegmentedBlock(key, &thread_local_value)) {
+    return &thread_local_value;
+  }
+
+  // 2. 遍历搜索层找数据块（引用1-124）
+  SearchNode* current_node = root_.get();
+  while (current_node && current_node->GetType() != SearchNode::kLeafNode) {
+    current_node = current_node->FindChild(key);
+  }
+
+  // 3. 数据块内查找（引用1-124）
+  DataBlock* data_block = nullptr;
+  if (current_node) {
+    data_block = current_node->FindDataBlock(key);
+  }
+  
+  if (!data_block) {
+    // 搜索层未找到，遍历数据层（引用1-119）
+    std::vector<DataBlock*> all_data_blocks;
+    CollectAllDataBlocks(root_.get(), &all_data_blocks);
+    
+    for (DataBlock* db : all_data_blocks) {
+      if (db->GetMinKey() <= key && key <= db->GetMaxKey()) {
+        data_block = db;
+        break;
+      }
+    }
+    
     if (!data_block) {
       return nullptr;
     }
   }
 
-  // 3. 带版本一致性检查的查找（引用1-93）
+  // 4. 带版本一致性检查的查找（引用1-93）
   const uint64_t* value = nullptr;
   const uint32_t max_retries = 3;  // 最大重试次数
   for (uint32_t i = 0; i < max_retries; ++i) {

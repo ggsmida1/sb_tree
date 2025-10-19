@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <cstdint>
 #include "data_block.h"
 #include "constants.h"
@@ -53,7 +54,8 @@ class SearchNode {
   std::vector<DataBlock*> data_blocks_;            // 叶子节点：数据块指针
   std::vector<std::unique_ptr<SearchNode>> children_;// 内部节点：子节点
   BlockAllocator* allocator_;                      // 块分配器
-  mutable std::mutex write_mutex_;                 // 写锁（ROWEX：仅写线程持有，引用1-92）
+  mutable std::shared_mutex rw_mutex_;             // 读写锁（ROWEX改进：支持多读单写，引用1-92）
+  mutable std::mutex write_mutex_;                 // 写锁（用于写操作的独占保护）
 };
 
 #endif  // SEARCH_NODE_H_

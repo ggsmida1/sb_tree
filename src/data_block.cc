@@ -15,6 +15,9 @@ DataBlock::DataBlock(BlockAllocator* allocator)
 }
 
 int DataBlock::Insert(uint64_t key, uint64_t value, std::unique_ptr<DataBlock>* split_block) {
+  // 使用写互斥锁保护并发写操作
+  std::unique_lock<std::mutex> write_lock(write_mutex_);
+  
   version_.WriteLock();  // 写锁：标记写入开始（引用1-93）
   // 使用RAII确保解锁
   struct WriteUnlocker {
@@ -25,9 +28,10 @@ int DataBlock::Insert(uint64_t key, uint64_t value, std::unique_ptr<DataBlock>* 
 
   if (IsFull()) {
     // 块满：尝试分裂（仅延迟数据插入时触发，引用1-120）
-    std::lock_guard<std::mutex> lock(split_mutex_);
-    if (IsFull()) {
-      *split_block = Split();
+    // 注意：split_mutex_ 在这里不需要了，因为我们已经有 write_mutex_
+    if (split_block) {
+      std::unique_ptr<DataBlock> new_block = Split();
+      
       // 判断key应插入当前块还是新块
       if (key <= keys_.back()) {
         // 插入当前块（前半部分）
@@ -37,15 +41,21 @@ int DataBlock::Insert(uint64_t key, uint64_t value, std::unique_ptr<DataBlock>* 
         values_.insert(values_.begin() + pos, value);
         size_++;
         search_table_.Update(keys_, size_);
+        *split_block = std::move(new_block);
         return 0;
       } else {
         // 插入新块（后半部分）
-        if ((*split_block)->Insert(key, value, nullptr) != 0) {
+        // 释放当前块的锁，避免死锁
+        write_lock.unlock();
+        
+        if (new_block->Insert(key, value, nullptr) != 0) {
           return -1;  // 新块也满（理论上不会发生）
         }
+        *split_block = std::move(new_block);
         return 1;
       }
     }
+    return -1;  // 块满但没有提供split_block参数
   }
 
   // 正常插入：保持键有序（引用1-73）
