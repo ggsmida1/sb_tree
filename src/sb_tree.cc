@@ -9,6 +9,12 @@
 #include <algorithm>
 
 // 线程局部存储初始化（如果需要的话）
+// 稳定线程ID分配：0..N-1（N <= kSegmentedBlockMaxThreads）
+static std::atomic<size_t> g_thread_id_counter{0};
+thread_local size_t tls_thread_id = SIZE_MAX;
+// 线程局部最大键发布（减少全局CAS竞争）
+thread_local uint64_t tls_local_max_key = 0;
+thread_local uint64_t tls_published_max_key = 0;
 
 // -----------------------------------------------------------------------------
 // SBTree 实现（论文3.1节、4节，引用1-23、1-61）
@@ -54,11 +60,21 @@ bool SBTree::IsDelayedData(uint64_t key) const {
 }
 
 bool SBTree::Insert(uint64_t key, uint64_t value) {
-  // 更新全局最大键（原子操作，引用1-103）
-  uint64_t old_max = current_max_key_.load(std::memory_order_acquire);
-  while (key > old_max && !current_max_key_.compare_exchange_weak(
-      old_max, key, std::memory_order_acq_rel, std::memory_order_acquire)) {
-    // 自旋等待直到更新成功
+  // 线程局部更新 + 分批发布到全局，降低CAS竞争
+  if (key > tls_local_max_key) {
+    tls_local_max_key = key;
+    // 每提升一定幅度再发布一次
+    constexpr uint64_t kPublishStep = 1024;
+    if (tls_local_max_key - tls_published_max_key >= kPublishStep) {
+      uint64_t observed = current_max_key_.load(std::memory_order_relaxed);
+      while (tls_local_max_key > observed &&
+             !current_max_key_.compare_exchange_weak(observed, tls_local_max_key,
+                                                    std::memory_order_release,
+                                                    std::memory_order_relaxed)) {
+        // CAS失败时 observed 已更新为新值，循环重试直到不需要更新
+      }
+      tls_published_max_key = tls_local_max_key;
+    }
   }
 
   // 1. 判断是否为延迟数据（引用1-120）
@@ -76,12 +92,20 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
       continue;
     }
 
-    // 获取当前线程的PerThreadBlock（引用1-71）
-    const size_t thread_id = std::hash<std::thread::id>{}(std::this_thread::get_id()) % 
-                            kSegmentedBlockMaxThreads;
+    // 获取稳定的线程ID并索引slot（避免冲突）
+    if (tls_thread_id == SIZE_MAX) {
+      tls_thread_id = g_thread_id_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    const size_t thread_id = (tls_thread_id < kSegmentedBlockMaxThreads) 
+                             ? tls_thread_id 
+                             : (tls_thread_id % kSegmentedBlockMaxThreads);
+    // 在slot分配、校验以及实际插入期间持有写者计数，防止转换器提前steal
     seg->BeginWrite();
     PerThreadDataBlock* pt_block = seg->AllocatePerThreadBlock(thread_id);
-    if (!pt_block) return false;
+    if (!pt_block) {
+      seg->EndWrite();
+      return false;
+    }
     // 再次确认seg仍为当前分段块且slot未被替换
     if (seg != current_segmented_block_.load(std::memory_order_acquire)) {
       seg->EndWrite();
@@ -93,33 +117,42 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
       std::this_thread::yield();
       continue;
     }
-
+ 
     // 3. 插入PerThreadBlock（引用1-103）
     if (pt_block->Insert(key, value)) {
       // 更新分段块的键范围
       seg->UpdateKeyRange(key);
       
       // 4. 检查分段块是否需要转换（引用1-105）
-      if (seg->NeedConversion(current_max_key_.load(std::memory_order_acquire))) {
-        // 创建新分段块并原子替换（引用P0）
-        seg->EndWrite();
+      const bool need_convert = seg->NeedConversion(current_max_key_.load(std::memory_order_relaxed));
+      // 结束写者计数（仅一次）
+      seg->EndWrite();
+      if (need_convert) {
+        // 仅允许一个线程发起交换：CAS序列化
+        SegmentedBlock* expected = seg;
         SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
-        SegmentedBlock* old_seg = current_segmented_block_.exchange(new_seg, std::memory_order_acq_rel);
-        // 提交转换任务（异步，引用1-107）
-        converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(old_seg));
-      }
-      else {
-        seg->EndWrite();
+        if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          seg->MarkConversionTriggered();
+          converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
+        } else {
+          delete new_seg;  // 其他线程已完成交换
+        }
       }
       return true;
     }
-
+ 
     // 5. PerThreadBlock满：提交转换任务并在下次循环中重试（引用1-105）
     seg->EndWrite();
     {
+      // 仅允许一个线程发起交换：CAS序列化
+      SegmentedBlock* expected = seg;
       SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
-      SegmentedBlock* old_seg = current_segmented_block_.exchange(new_seg, std::memory_order_acq_rel);
-      converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(old_seg));
+      if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        seg->MarkConversionTriggered();
+        converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
+      } else {
+        delete new_seg;
+      }
     }
     // 继续循环，重试插入新分段块
   }
@@ -364,17 +397,24 @@ const uint64_t* SBTree::Lookup(uint64_t key) const {
     }
   }
 
-  // 4. 带版本一致性检查的查找（引用1-93）
-  const uint64_t* value = nullptr;
-  const uint32_t max_retries = 3;  // 最大重试次数
-  for (uint32_t i = 0; i < max_retries; ++i) {
-    value = data_block->Lookup(key);
-    if (value) {
+  // 4. 可能沿链表前进（转换后的块通过next相连）
+  const uint32_t max_retries = 3;  // 每个块的最大重试次数
+  while (data_block) {
+    const uint64_t* value = nullptr;
+    for (uint32_t i = 0; i < max_retries; ++i) {
+      value = data_block->Lookup(key);
+      if (value) {
+        return value;
+      }
+      std::this_thread::yield();
+    }
+    if (key > data_block->GetMaxKey()) {
+      data_block = data_block->GetNextBlock().get();
+    } else {
       break;
     }
-    std::this_thread::yield();  // 版本不一致，重试
   }
-  return value;
+  return nullptr;
 }
 
 size_t SBTree::Scan(uint64_t start_key, size_t count, 

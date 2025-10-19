@@ -59,6 +59,9 @@ target_link_libraries(debug_test sb_tree)
 add_executable(simple_test test/simple_test.cc)
 target_link_libraries(simple_test sb_tree)
 
+# 包含测试目录的CMakeLists.txt
+add_subdirectory(test)
+
 # 安装目标
 install(TARGETS sb_tree basic_test performance_test concurrent_test benchmark
         RUNTIME DESTINATION bin

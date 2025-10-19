@@ -32,13 +32,10 @@ BlockAllocator::PerThreadFreeList& BlockAllocator::GetPerThreadFreeList() {
 void* BlockAllocator::Allocate() {
   auto& tls_list = GetPerThreadFreeList();
   // 先从线程局部列表分配（无锁）
-  {
-    std::lock_guard<std::mutex> lock(tls_list.mutex);
-    if (!tls_list.free_blocks.empty()) {
-      void* block = tls_list.free_blocks.back();
-      tls_list.free_blocks.pop_back();
-      return block;
-    }
+  if (!tls_list.free_blocks.empty()) {
+    void* block = tls_list.free_blocks.back();
+    tls_list.free_blocks.pop_back();
+    return block;
   }
 
   // 线程局部列表为空，从全局备用列表分配（引用1-90）
@@ -62,7 +59,6 @@ void BlockAllocator::Deallocate(void* block) {
   }
   auto& tls_list = GetPerThreadFreeList();
   // 释放到线程局部列表（无锁）
-  std::lock_guard<std::mutex> lock(tls_list.mutex);
   tls_list.free_blocks.push_back(block);
 
   // 线程局部列表过大，转移部分到全局列表（避免内存浪费）

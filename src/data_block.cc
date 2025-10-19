@@ -60,11 +60,18 @@ int DataBlock::Insert(uint64_t key, uint64_t value, std::unique_ptr<DataBlock>* 
 
   // 正常插入：保持键有序（引用1-73）
   auto it = std::lower_bound(keys_.begin(), keys_.end(), key);
-  size_t pos = std::distance(keys_.begin(), it);
+  const size_t pos = std::distance(keys_.begin(), it);
+  const size_t old_size = size_;
   keys_.insert(it, key);
   values_.insert(values_.begin() + pos, value);
-  size_++;
-  search_table_.Update(keys_, size_);  // 实时更新N元表
+  size_ = old_size + 1;
+  // 降低N元表更新频率：在桶边界或桶数量变化时更新
+  const size_t old_buckets = search_table_.GetNumBuckets(old_size);
+  const size_t new_buckets = search_table_.GetNumBuckets(size_);
+  const bool bucket_boundary = (pos % search_table_.GetBucketSize()) == 0 || pos == 0;
+  if (bucket_boundary || new_buckets != old_buckets) {
+    search_table_.Update(keys_, size_);
+  }
   return 0;
 }
 
@@ -88,6 +95,27 @@ std::unique_ptr<DataBlock> DataBlock::Split() {
   new_block->SetNextBlock(std::move(next_block_));
   next_block_ = std::move(new_block);
   return std::move(next_block_);  // 返回新块（所有权转移）
+}
+
+void DataBlock::BulkFill(const std::vector<KeyValuePair>& kv, size_t start_idx, size_t end_idx) {
+  if (start_idx >= end_idx) return;
+  std::unique_lock<std::mutex> write_lock(write_mutex_);
+  version_.WriteLock();
+  struct WriteUnlocker {
+    Version& version_;
+    WriteUnlocker(Version& v) : version_(v) {}
+    ~WriteUnlocker() { version_.WriteUnlock(); }
+  } unlocker(version_);
+
+  const size_t count = end_idx - start_idx;
+  keys_.reserve(size_ + count);
+  values_.reserve(size_ + count);
+  for (size_t i = start_idx; i < end_idx; ++i) {
+    keys_.push_back(kv[i].key);
+    values_.push_back(kv[i].value);
+  }
+  size_ += count;
+  search_table_.Update(keys_, size_);
 }
 
 const uint64_t* DataBlock::Lookup(uint64_t key) const {

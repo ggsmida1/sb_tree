@@ -25,6 +25,9 @@ class SegmentedBlockConverter {
   /// 提交转换任务（非阻塞）
   void SubmitConversionTask(std::unique_ptr<SegmentedBlock> segmented_block);
 
+  /// 等待转换器空闲（所有任务处理完成）
+  void WaitForIdle();
+
  private:
   /// 转换线程主函数（论文4.2节：合并排序KV、创建数据块、更新搜索层）
   void ConversionThreadMain();
@@ -36,6 +39,7 @@ class SegmentedBlockConverter {
   std::mutex queue_mutex_;                        // 队列互斥锁
   std::condition_variable task_cv_;               // 任务通知条件变量
   std::atomic<bool> stop_thread_;                 // 线程停止标记
+  std::atomic<size_t> pending_tasks_{0};           // 待处理任务计数
 };
 
 #endif  // SEGMENTED_BLOCK_CONVERTER_H_

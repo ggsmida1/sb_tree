@@ -10,9 +10,19 @@ PerThreadDataBlock::PerThreadDataBlock(BlockAllocator* allocator)
 }
 
 bool PerThreadDataBlock::Insert(uint64_t key, uint64_t value) {
+  Lock();
   if (IsFull()) {
+    Unlock();
     return false;
   }
   kv_pairs_.emplace_back(KeyValuePair{key, value});
+  Unlock();
   return true;
+}
+
+void PerThreadDataBlock::CopyAllKvThreadSafe(std::vector<KeyValuePair>* out) const {
+  if (!out) return;
+  Lock();
+  out->insert(out->end(), kv_pairs_.begin(), kv_pairs_.end());
+  Unlock();
 }

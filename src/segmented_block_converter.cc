@@ -29,6 +29,7 @@ SegmentedBlockConverter::~SegmentedBlockConverter() {
 void SegmentedBlockConverter::SubmitConversionTask(std::unique_ptr<SegmentedBlock> segmented_block) {
   std::lock_guard<std::mutex> lock(queue_mutex_);
   task_queue_.push(std::move(segmented_block));
+  pending_tasks_.fetch_add(1, std::memory_order_relaxed);
   task_cv_.notify_one();  // 通知转换线程有新任务
 }
 
@@ -55,13 +56,13 @@ void SegmentedBlockConverter::ConversionThreadMain() {
 
     // 1. 合并所有PerThreadBlock的KV对（引用1-108）
     std::vector<KeyValuePair> merged_kv;
+    std::vector<PerThreadDataBlock*> garbage_list;
+    garbage_list.reserve(task->GetMaxThreads());
     for (size_t i = 0; i < task->GetMaxThreads(); ++i) {
       PerThreadDataBlock* pt_block = task->StealPerThreadBlock(i);
       if (!pt_block) continue;
-      const auto& kv_list = pt_block->GetAllKv();
-      merged_kv.insert(merged_kv.end(), kv_list.begin(), kv_list.end());
-      // 延迟释放：避免极短时间窗口与写入竞争
-      delete pt_block;
+      pt_block->CopyAllKvThreadSafe(&merged_kv);
+      garbage_list.push_back(pt_block);
     }
     if (merged_kv.empty()) continue;
 
@@ -72,21 +73,15 @@ void SegmentedBlockConverter::ConversionThreadMain() {
                 return a.key < b.key;
               });
 
-    // 3. 拆分并创建DataBlock（引用1-108）
+    // 3. 拆分并创建DataBlock（批量填充，引用1-108）
     std::vector<std::unique_ptr<DataBlock>> data_blocks;
     size_t kv_idx = 0;
     const size_t total_kv = merged_kv.size();
     while (kv_idx < total_kv) {
       auto data_block = std::make_unique<DataBlock>(allocator_);
-      size_t insert_count = 0;
-      while (kv_idx < total_kv && insert_count < kDataBlockCapacity) {
-        const auto& kv = merged_kv[kv_idx];
-        if (data_block->Insert(kv.key, kv.value, nullptr) != 0) {
-          break;  // 块满（理论上不会发生）
-        }
-        kv_idx++;
-        insert_count++;
-      }
+      size_t end_idx = std::min(kv_idx + kDataBlockCapacity, total_kv);
+      data_block->BulkFill(merged_kv, kv_idx, end_idx);
+      kv_idx = end_idx;
       data_blocks.push_back(std::move(data_block));
     }
 
@@ -99,5 +94,19 @@ void SegmentedBlockConverter::ConversionThreadMain() {
     if (!data_blocks.empty()) {
       sb_tree_->UpdateSearchLayerWithDataBlocks(std::move(data_blocks));
     }
+    // 延迟回收被偷取的块，确保转换完成后统一释放
+    for (PerThreadDataBlock* ptr : garbage_list) {
+      delete ptr;
+    }
+    
+    // 6. 任务完成，减少待处理计数
+    pending_tasks_.fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+
+void SegmentedBlockConverter::WaitForIdle() {
+  // 等待所有待处理任务完成
+  while (pending_tasks_.load(std::memory_order_acquire) > 0) {
+    std::this_thread::yield();
   }
 }

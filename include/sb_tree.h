@@ -25,6 +25,9 @@ class SBTree {
   size_t Scan(uint64_t start_key, size_t count, 
               std::vector<KeyValuePair>* result) const;
 
+  // 等待转换器空闲（用于测试同步）
+  void WaitForConverterIdle() { converter_.WaitForIdle(); }
+
   /// 供转换线程调用：更新搜索层（论文4.3节，引用1-119）
   void UpdateSearchLayerWithDataBlocks(std::vector<std::unique_ptr<DataBlock>> data_blocks);
 

@@ -31,6 +31,9 @@ class DataBlock {
   /// @return 0：成功，1：需分裂，-1：失败
   int Insert(uint64_t key, uint64_t value, std::unique_ptr<DataBlock>* split_block);
 
+  /// 批量填充（转换器专用，单次加锁、统一更新N元表）
+  void BulkFill(const std::vector<KeyValuePair>& kv, size_t start_idx, size_t end_idx);
+
   /// 查找键（带版本一致性检查，引用1-93）
   const uint64_t* Lookup(uint64_t key) const;
 

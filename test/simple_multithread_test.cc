@@ -75,8 +75,12 @@ int main() {
     std::cout << "成功插入: " << success_count.load() << std::endl;
     std::cout << "失败插入: " << fail_count.load() << std::endl;
     
+    // 等待转换器完成所有任务
+    std::cout << "3. 等待转换器完成..." << std::endl;
+    multi_tree.WaitForConverterIdle();
+    
     // 验证多线程结果
-    std::cout << "3. 多线程结果验证..." << std::endl;
+    std::cout << "4. 多线程结果验证..." << std::endl;
     int multi_verified = 0;
     int errors = 0;
     

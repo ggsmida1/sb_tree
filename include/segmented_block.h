@@ -34,6 +34,7 @@ class SegmentedBlock {
   /// 精准判断是否需要转换（论文4.2节：块满数量达标+存在键溢出）
   /// @param current_max_key 当前全局最大键
   bool NeedConversion(uint64_t current_max_key) const;
+  void MarkConversionTriggered();
 
   // 写者协调（用于安全转换）
   void BeginWrite();
@@ -49,7 +50,8 @@ class SegmentedBlock {
   BlockAllocator* allocator_;                         // 块分配器
   std::atomic<uint64_t> min_key_;                     // 分段块内最小键（原子更新）
   std::atomic<uint64_t> max_key_;                     // 分段块内最大键（原子更新）
-  std::atomic<uint32_t> active_writers_{0};           // 活跃写者计数
+  alignas(64) std::atomic<uint32_t> active_writers_{0};           // 活跃写者计数（避免伪共享）
+  alignas(64) std::atomic<uint64_t> last_conversion_ns_{0};        // 上次转换触发时间（ns）
 };
 
 #endif  // SEGMENTED_BLOCK_H_

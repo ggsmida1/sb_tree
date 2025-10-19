@@ -248,14 +248,131 @@ constexpr size_t kBlockSize = 4096;                // 固定块大小
 感谢论文作者提供的理论基础和设计思路，以及开源社区的支持和贡献。
 
 
-mkdir build && cd build
-cmake ..
-make -j4
+## 编译和运行测试
 
-# 运行测试
-./simple_test      # 基础组件测试
-./debug_test       # 调试测试
-./basic_test       # 基本功能测试
-./performance_test # 性能测试
-./concurrent_test  # 并发测试
-./benchmark     
+### 编译步骤
+
+```bash
+# 创建构建目录
+mkdir build && cd build
+
+# 配置项目
+cmake ..
+
+# 编译所有测试
+make -j4
+```
+
+### 测试文件说明和运行指令
+
+#### 基本功能测试
+```bash
+# 基础组件测试 - 验证核心数据结构
+./simple_test
+
+# 基本功能测试 - 插入、查找、扫描功能验证
+./basic_test
+
+# 调试测试 - 详细调试信息和错误检查
+./debug_test
+```
+
+#### 性能测试
+```bash
+# 性能测试 - 吞吐量、延迟、内存使用分析
+./performance_test
+
+# 基准测试 - 不同工作负载下的性能表现
+./benchmark_test
+```
+
+#### 并发测试
+```bash
+# 简单多线程测试 - 4线程插入测试，验证数据一致性
+./simple_multithread_test
+
+# 详细多线程测试 - 2线程小规模测试，分析数据丢失
+./detailed_multithread_test
+
+# 多线程插入测试 - 8线程大规模测试，性能对比
+./multithreaded_insert_test
+
+# 并发测试 - 多线程插入、查找、扫描综合测试
+./concurrent_test
+```
+
+#### 性能对比和演示测试
+```bash
+# 性能对比测试 - 不同线程数下的性能对比
+./performance_comparison_test
+
+# 保守性能测试 - 低并发测试，避免段错误
+./conservative_performance_test
+
+# 最终性能演示 - 完整的多线程性能展示
+./final_performance_demo
+```
+
+#### 调试和特殊测试
+```bash
+# 调试插入测试 - 插入过程的详细调试
+./debug_insert
+
+# 简单插入测试 - 基础插入功能验证
+./simple_insert_test
+
+# 转换测试 - 分段块转换机制测试
+./test_need_conversion
+```
+
+### 测试分类说明
+
+| 测试类型 | 测试文件 | 主要目的 | 适用场景 |
+|---------|---------|---------|---------|
+| **基本功能** | `basic_test` | 验证插入、查找、扫描基本功能 | 开发调试 |
+| **基本功能** | `simple_test` | 验证核心数据结构正确性 | 单元测试 |
+| **基本功能** | `debug_test` | 详细调试信息和错误检查 | 问题诊断 |
+| **性能测试** | `performance_test` | 吞吐量、延迟、内存分析 | 性能评估 |
+| **性能测试** | `benchmark_test` | 不同工作负载性能表现 | 基准测试 |
+| **并发测试** | `simple_multithread_test` | 4线程插入，数据一致性验证 | 并发正确性 |
+| **并发测试** | `detailed_multithread_test` | 2线程小规模，数据丢失分析 | 并发调试 |
+| **并发测试** | `multithreaded_insert_test` | 8线程大规模，性能对比 | 并发性能 |
+| **并发测试** | `concurrent_test` | 多线程综合测试 | 并发综合 |
+| **性能演示** | `final_performance_demo` | 完整多线程性能展示 | 性能展示 |
+| **性能演示** | `performance_comparison_test` | 不同线程数性能对比 | 性能对比 |
+| **性能演示** | `conservative_performance_test` | 低并发测试，避免崩溃 | 稳定性测试 |
+| **调试测试** | `debug_insert` | 插入过程详细调试 | 问题诊断 |
+| **调试测试** | `simple_insert_test` | 基础插入功能验证 | 功能验证 |
+| **调试测试** | `test_need_conversion` | 分段块转换机制测试 | 机制验证 |
+
+### 快速测试流程
+
+```bash
+# 1. 基本功能验证
+./simple_test && ./basic_test
+
+# 2. 并发正确性测试
+./detailed_multithread_test
+
+# 3. 性能测试
+./simple_multithread_test
+
+# 4. 完整性能展示
+./final_performance_demo
+```     
+
+
+==============================================
+    SB-Tree 多线程插入性能优化展示
+===============================================
+
+测试配置:
+  每线程插入数: 1000
+  测试线程数: 1, 2, 4, 8
+
+线程数     耗时(ms)吞吐量(ops/s)   成功率 加速比
+----------------------------------------------------------------------
+运行 1 线程测试...       1            1.0        1000000       100.0%      1.00x
+运行 2 线程测试...       2            1.0        1894000        94.7%      1.89x
+运行 4 线程测试...       4            1.0        2874000        71.9%      2.87x
+运行 8 线程测试...--: line 1: 72056 Segmentation fault      (core dumped) ./final_performance_demo

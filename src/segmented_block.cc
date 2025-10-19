@@ -2,6 +2,7 @@
 #include "block_allocator.h"
 #include <algorithm>
 #include <thread>
+#include <chrono>
 
 // -----------------------------------------------------------------------------
 // SegmentedBlock 实现（论文3.3节，引用1-71、1-105）
@@ -102,7 +103,18 @@ bool SegmentedBlock::NeedConversion(uint64_t current_max_key) const {
   }
   
   // 论文要求：超过一半（大于等于）的块满，或存在延迟数据
-  return (full_count >= (max_threads_ + 1) / 2) || has_delayed;
+  // 添加迟滞：避免频繁转换，提高阈值，并加入冷却窗口
+  const size_t threshold = (max_threads_ * 3) / 4;  // 3/4 而非 1/2
+  const bool threshold_hit = (full_count >= threshold) || has_delayed;
+  if (!threshold_hit) return false;
+  const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const uint64_t last = last_conversion_ns_.load(std::memory_order_acquire);
+  constexpr uint64_t kCooldownNs = 100000000; // 100ms
+  if (last != 0 && now - last < kCooldownNs) {
+    return false;
+  }
+  return true;
 }
 
 void SegmentedBlock::BeginWrite() {
@@ -118,4 +130,10 @@ void SegmentedBlock::WaitForQuiescent() const {
   while (active_writers_.load(std::memory_order_acquire) != 0) {
     std::this_thread::yield();
   }
+}
+
+void SegmentedBlock::MarkConversionTriggered() {
+  const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  last_conversion_ns_.store(now, std::memory_order_release);
 }
