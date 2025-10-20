@@ -433,20 +433,26 @@ void SBTree::UpdateSearchLayerWithDataBlocks(std::vector<std::unique_ptr<DataBlo
   std::vector<DataBlock*> data_block_ptrs;
   data_block_ptrs.reserve(data_blocks.size());
   
-  // 转移所有权到数据层容器
+  // 先收集所有指针
+  for (auto& block : data_blocks) {
+    if (block) {
+      data_block_ptrs.push_back(block.get());
+    }
+  }
+  
+  // 先更新搜索层（获取search_layer_write_mutex_）
+  for (DataBlock* block_ptr : data_block_ptrs) {
+    InsertDataBlockToSearchLayer(block_ptr);
+  }
+  
+  // 最后转移所有权到数据层容器（获取data_layer_mutex_）
   {
     std::lock_guard<std::mutex> lock(data_layer_mutex_);
     for (auto& block : data_blocks) {
       if (block) {
-        data_block_ptrs.push_back(block.get());
         data_layer_blocks_.push_back(std::move(block));
       }
     }
-  }
-  
-  // 搜索层仅持有引用
-  for (DataBlock* block_ptr : data_block_ptrs) {
-    InsertDataBlockToSearchLayer(block_ptr);
   }
 }
 

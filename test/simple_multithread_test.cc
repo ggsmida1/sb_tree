@@ -9,7 +9,7 @@ int main() {
     std::cout << "=== 简单多线程插入测试 ===" << std::endl;
     
     const int num_threads = 4;
-    const int inserts_per_thread = 1000;
+    const int inserts_per_thread = 2000;
     
     std::cout << "线程数: " << num_threads << std::endl;
     std::cout << "每线程插入数: " << inserts_per_thread << std::endl;

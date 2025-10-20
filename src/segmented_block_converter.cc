@@ -14,22 +14,16 @@
 SegmentedBlockConverter::SegmentedBlockConverter(SBTree* sb_tree, BlockAllocator* allocator)
     : sb_tree_(sb_tree),
       allocator_(allocator),
-      stop_threads_(false),
-      num_converter_threads_(std::max(2u, std::thread::hardware_concurrency() / 2)) {
-  // 启动多线程转换器池（论文建议多线程处理）
-  conversion_threads_.reserve(num_converter_threads_);
-  for (size_t i = 0; i < num_converter_threads_; ++i) {
-    conversion_threads_.emplace_back(std::bind(&SegmentedBlockConverter::ConversionThreadMain, this));
-  }
+      stop_thread_(false) {
+  // 启动专用转换线程（论文4.2节：单线程转换，避免并发复杂性）
+  conversion_thread_ = std::thread(std::bind(&SegmentedBlockConverter::ConversionThreadMain, this));
 }
 
 SegmentedBlockConverter::~SegmentedBlockConverter() {
-  stop_threads_ = true;
-  task_cv_.notify_all();  // 唤醒所有线程退出
-  for (auto& thread : conversion_threads_) {
-    if (thread.joinable()) {
-      thread.join();
-    }
+  stop_thread_ = true;
+  task_cv_.notify_one();  // 唤醒转换线程退出
+  if (conversion_thread_.joinable()) {
+    conversion_thread_.join();
   }
 }
 
@@ -49,7 +43,7 @@ void SegmentedBlockConverter::SubmitIndexTask(DataBlock* data_block) {
 }
 
 void SegmentedBlockConverter::ConversionThreadMain() {
-  while (!stop_threads_) {
+  while (!stop_thread_) {
     std::vector<std::unique_ptr<SegmentedBlock>> batch_tasks;
     std::vector<DataBlock*> batch_index_tasks;
     
@@ -60,10 +54,10 @@ void SegmentedBlockConverter::ConversionThreadMain() {
       // 等待任务或批量超时
       auto timeout = std::chrono::nanoseconds(kBatchTimeoutNs);
       task_cv_.wait_for(lock, timeout, [this]() {
-        return stop_threads_ || !task_queue_.empty() || !index_queue_.empty();
+        return stop_thread_ || !task_queue_.empty() || !index_queue_.empty();
       });
       
-      if (stop_threads_ && task_queue_.empty() && index_queue_.empty()) {
+      if (stop_thread_ && task_queue_.empty() && index_queue_.empty()) {
         break;
       }
       

@@ -37,14 +37,13 @@ class SegmentedBlockConverter {
 
   SBTree* sb_tree_;                               // 指向SBTree实例
   BlockAllocator* allocator_;                     // 块分配器
-  std::vector<std::thread> conversion_threads_;   // 多线程转换器池
+  std::thread conversion_thread_;                  // 专用转换线程
   std::queue<std::unique_ptr<SegmentedBlock>> task_queue_;  // 任务队列
   std::queue<DataBlock*> index_queue_;            // 索引任务队列
   std::mutex queue_mutex_;                        // 队列互斥锁
   std::condition_variable task_cv_;               // 任务通知条件变量
-  std::atomic<bool> stop_threads_;                // 线程停止标记
+  std::atomic<bool> stop_thread_;                 // 线程停止标记
   std::atomic<size_t> pending_tasks_{0};           // 待处理任务计数
-  size_t num_converter_threads_;                   // 转换器线程数
   
   // 批量转换优化（论文要求）
   static constexpr size_t kBatchSize = 4;          // 批量处理大小
