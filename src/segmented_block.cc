@@ -150,3 +150,8 @@ void SegmentedBlock::MarkConversionTriggered() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
   last_conversion_ns_.store(now, std::memory_order_release);
 }
+
+size_t SegmentedBlock::AllocateSlot() {
+  // 修复P0-2：原子分配slot，避免线程ID冲突
+  return next_slot_.fetch_add(1, std::memory_order_acq_rel) % max_threads_;
+}

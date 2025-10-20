@@ -96,11 +96,8 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
       continue;
     }
 
-    // 获取稳定的线程ID并索引slot（避免冲突）
-    if (tls_thread_id == SIZE_MAX) {
-      tls_thread_id = g_thread_id_counter.fetch_add(1, std::memory_order_relaxed);
-    }
-    const size_t thread_id = tls_thread_id % kSegmentedBlockMaxThreads;
+    // 修复P0-2：使用SegmentedBlock内部slot分配，避免线程ID冲突
+    const size_t thread_id = seg->AllocateSlot();
 
     bool inserted = false;
     bool need_convert = false;
@@ -226,7 +223,7 @@ bool SBTree::InsertDelayedData(uint64_t key, uint64_t value) {
           target_block = curr;
           break;
         }
-        curr = curr->GetNextBlock().get();
+        curr = curr->GetNextBlock();
       }
       if (target_block) {
         break;
@@ -287,7 +284,7 @@ bool SBTree::InsertDelayedData(uint64_t key, uint64_t value) {
       DataBlock* new_block_ptr = split_block.get();
 
       // 新块挂入链表：new.next = old.next; old.next = new
-      split_block->SetNextBlock(std::move(target_block->GetNextBlock()));
+      split_block->SetNextBlockPtr(target_block->GetNextBlock());
       target_block->SetNextBlock(std::move(split_block));
 
       // 仅由转换线程更新搜索层，这里只提交"锚点键"索引任务
@@ -429,30 +426,29 @@ void SBTree::UpdateSearchLayerWithDataBlocks(std::vector<std::unique_ptr<DataBlo
     return;
   }
   
-  // 修复P0-1：数据层所有权管理 - 先转移所有权，再获取引用
+  // 修复P0-1：统一所有权模型 - 容器唯一持有，链表只存裸指针
+  // 1. 先转移所有权到数据层容器
   std::vector<DataBlock*> data_block_ptrs;
   data_block_ptrs.reserve(data_blocks.size());
   
-  // 先收集所有指针
-  for (auto& block : data_blocks) {
-    if (block) {
-      data_block_ptrs.push_back(block.get());
-    }
-  }
-  
-  // 先更新搜索层（获取search_layer_write_mutex_）
-  for (DataBlock* block_ptr : data_block_ptrs) {
-    InsertDataBlockToSearchLayer(block_ptr);
-  }
-  
-  // 最后转移所有权到数据层容器（获取data_layer_mutex_）
   {
     std::lock_guard<std::mutex> lock(data_layer_mutex_);
     for (auto& block : data_blocks) {
       if (block) {
+        data_block_ptrs.push_back(block.get());
         data_layer_blocks_.push_back(std::move(block));
       }
     }
+  }
+  
+  // 2. 建立链表关系（只存裸指针，不转移所有权）
+  for (size_t i = 0; i < data_block_ptrs.size() - 1; ++i) {
+    data_block_ptrs[i]->SetNextBlockPtr(data_block_ptrs[i + 1]);
+  }
+  
+  // 3. 将每个块都索引到搜索层（确保所有块都可见）
+  for (DataBlock* block_ptr : data_block_ptrs) {
+    InsertDataBlockToSearchLayer(block_ptr);
   }
 }
 
@@ -554,7 +550,7 @@ const uint64_t* SBTree::Lookup(uint64_t key) const {
       std::this_thread::yield();
     }
     if (key > data_block->GetMaxKey()) {
-      data_block = data_block->GetNextBlock().get();
+      data_block = data_block->GetNextBlock();
     } else {
       break;
     }

@@ -8,6 +8,7 @@
 // -----------------------------------------------------------------------------
 DataBlock::DataBlock(BlockAllocator* allocator)
     : search_table_(kDataBlockCapacity, kNAryBucketSize),
+      next_block_(nullptr),
       size_(0),
       allocator_(allocator) {
   keys_.reserve(kDataBlockCapacity);

@@ -124,12 +124,8 @@ void SegmentedBlockConverter::ConversionThreadMain() {
         data_blocks.push_back(std::move(data_block));
       }
 
-      // 4. 链接DataBlock（形成链表，引用1-65）
-      for (size_t i = 0; i < data_blocks.size() - 1; ++i) {
-        data_blocks[i]->SetNextBlock(std::move(data_blocks[i + 1]));
-      }
-
-      // 5. 通知SBTree更新搜索层（引用1-119）
+      // 4. 通知SBTree更新搜索层（引用1-119）
+      // 修复P0-1：不再在转换器中建立链表，由SBTree统一管理所有权
       if (!data_blocks.empty()) {
         sb_tree_->UpdateSearchLayerWithDataBlocks(std::move(data_blocks));
       }

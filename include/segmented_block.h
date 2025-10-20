@@ -26,6 +26,9 @@ class SegmentedBlock {
   // 原子夺取指定slot（转换时使用，转移所有权给调用方）
   PerThreadDataBlock* StealPerThreadBlock(size_t thread_id);
 
+  // 修复P0-2：内部增量分配slot，避免线程ID冲突
+  size_t AllocateSlot();
+
   size_t GetMaxThreads() const { return max_threads_; }
 
   /// 更新分段块的键范围（在插入时调用）
@@ -53,6 +56,7 @@ class SegmentedBlock {
   alignas(64) std::atomic<uint32_t> active_writers_{0};           // 活跃写者计数（避免伪共享）
   alignas(64) std::atomic<uint64_t> last_conversion_ns_{0};        // 上次转换触发时间（ns）
   alignas(64) std::atomic<bool> conversion_triggered_{false};     // 修复P0-2：转换触发标记
+  alignas(64) std::atomic<size_t> next_slot_{0};                  // 修复P0-2：下一个可分配slot
 };
 
 /// 写者作用域守卫：构造BeginWrite，析构EndWrite，确保成对调用

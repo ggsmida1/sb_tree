@@ -45,8 +45,9 @@ class DataBlock {
   // 基础访问接口
   uint64_t GetMinKey() const { return (size_ > 0) ? keys_[0] : kInvalidKey; }
   uint64_t GetMaxKey() const { return (size_ > 0) ? keys_.back() : kInvalidKey; }
-  std::unique_ptr<DataBlock>& GetNextBlock() { return next_block_; }
-  void SetNextBlock(std::unique_ptr<DataBlock> next) { next_block_ = std::move(next); }
+  DataBlock* GetNextBlock() const { return next_block_; }
+  void SetNextBlock(std::unique_ptr<DataBlock> next) { next_block_ = next.release(); }
+  void SetNextBlockPtr(DataBlock* next) { next_block_ = next; }
   bool IsFull() const { return size_ >= kDataBlockCapacity; }
   size_t GetSize() const { return size_; }
   Version& GetVersion() { return version_; }
@@ -59,7 +60,7 @@ class DataBlock {
   std::vector<uint64_t> keys_;               // 键数组（始终有序，引用1-73）
   std::vector<uint64_t> values_;           // 值数组（与键一一对应，引用1-73）
   NArySearchTable search_table_;            // N元搜索表（引用1-87）
-  std::unique_ptr<DataBlock> next_block_;   // 下一个数据块（链表，引用1-65）
+  DataBlock* next_block_;                    // 下一个数据块（链表，引用1-65）
   size_t size_;                             // 当前元素数量
   BlockAllocator* allocator_;               // 块分配器（引用1-89）
   Version version_;                         // 版本锁（引用1-93）
