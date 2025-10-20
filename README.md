@@ -313,6 +313,21 @@ make -j4
 ./final_performance_demo
 ```
 
+#### 吞吐量测试
+```bash
+# 插入吞吐量测试 - 纯插入性能测试
+./insert_throughput_test
+
+# 简单吞吐量测试 - 1-2线程吞吐量测试
+./simple_throughput_test
+
+# 吞吐量模式测试 - 不同模式的吞吐量对比
+./throughput_modes_test
+
+# 安全吞吐量测试 - 降低插入数量避免崩溃
+./safe_throughput_test
+```
+
 #### 调试和特殊测试
 ```bash
 # 调试插入测试 - 插入过程的详细调试
@@ -341,6 +356,10 @@ make -j4
 | **性能演示** | `final_performance_demo` | 完整多线程性能展示 | 性能展示 |
 | **性能演示** | `performance_comparison_test` | 不同线程数性能对比 | 性能对比 |
 | **性能演示** | `conservative_performance_test` | 低并发测试，避免崩溃 | 稳定性测试 |
+| **吞吐量测试** | `insert_throughput_test` | 纯插入性能测试 | 插入性能评估 |
+| **吞吐量测试** | `simple_throughput_test` | 1-2线程吞吐量测试 | 低并发性能 |
+| **吞吐量测试** | `throughput_modes_test` | 不同模式吞吐量对比 | 模式对比 |
+| **吞吐量测试** | `safe_throughput_test` | 安全吞吐量测试，避免崩溃 | 稳定性测试 |
 | **调试测试** | `debug_insert` | 插入过程详细调试 | 问题诊断 |
 | **调试测试** | `simple_insert_test` | 基础插入功能验证 | 功能验证 |
 | **调试测试** | `test_need_conversion` | 分段块转换机制测试 | 机制验证 |
@@ -359,6 +378,12 @@ make -j4
 
 # 4. 完整性能展示
 ./final_performance_demo
+
+# 5. 吞吐量测试
+./insert_throughput_test
+
+# 6. 安全测试（避免崩溃）
+./safe_throughput_test
 ```     
 
 

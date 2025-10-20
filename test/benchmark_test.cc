@@ -183,7 +183,7 @@ public:
             auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
             
             int total_operations = completed_operations.load();
-            int total_scanned_count = total_scanned.load();
+            // int total_scanned_count = total_scanned.load();  // 暂时注释掉未使用的变量
             double duration_ms = duration.count() / 1000.0;
             double throughput = (total_operations * 1000.0) / duration_ms;
             double avg_latency = duration_ms * 1000.0 / total_operations;

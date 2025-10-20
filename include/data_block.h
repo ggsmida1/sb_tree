@@ -63,7 +63,7 @@ class DataBlock {
   size_t size_;                             // 当前元素数量
   BlockAllocator* allocator_;               // 块分配器（引用1-89）
   Version version_;                         // 版本锁（引用1-93）
-  mutable std::mutex write_mutex_;          // 写互斥锁（保护并发写操作）
+  // 修复P1-2：移除冗余的write_mutex_，使用pure version + atomic
   mutable std::mutex split_mutex_;          // 分裂互斥锁（避免并发分裂）
 };
 

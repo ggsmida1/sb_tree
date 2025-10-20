@@ -69,6 +69,10 @@ class SBTree {
   std::atomic<uint64_t> current_max_key_;                     // 当前全局最大键（原子更新）
   mutable std::mutex segmented_block_mutex_;                  // 分段块切换锁（不再用于fast-path）
   mutable std::mutex search_layer_write_mutex_;               // 搜索层写锁（ROWEX：单写线程，引用1-92）
+  
+  // 修复P0-1：数据层持有DataBlock所有权
+  std::vector<std::unique_ptr<DataBlock>> data_layer_blocks_;  // 数据层持有的所有DataBlock
+  mutable std::mutex data_layer_mutex_;                        // 保护数据层容器的互斥锁
 };
 
 #endif  // SB_TREE_H_

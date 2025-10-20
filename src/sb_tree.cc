@@ -7,6 +7,7 @@
 #include <thread>
 #include <functional>
 #include <algorithm>
+#include <iostream>
 
 // 线程局部存储初始化（如果需要的话）
 // 稳定线程ID分配：0..N-1（N <= kSegmentedBlockMaxThreads）
@@ -15,6 +16,9 @@ thread_local size_t tls_thread_id = SIZE_MAX;
 // 线程局部最大键发布（减少全局CAS竞争）
 thread_local uint64_t tls_local_max_key = 0;
 thread_local uint64_t tls_published_max_key = 0;
+
+// 修复P1-1：全局原子时间戳，替代thread_local节流机制
+static std::atomic<uint64_t> g_last_conversion_time{0};
 
 // -----------------------------------------------------------------------------
 // SBTree 实现（论文3.1节、4节，引用1-23、1-61）
@@ -103,6 +107,10 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
     {
       // 在slot分配、校验以及实际插入期间持有写者计数，防止转换器提前steal
       ScopedSegmentWrite guard(seg);
+      if (!guard.IsAcquired()) {
+        // 转换期间无法获取写锁，重新开始
+        continue;
+      }
       PerThreadDataBlock* pt_block = seg->AllocatePerThreadBlock(thread_id);
       if (!pt_block) {
         return false;
@@ -131,6 +139,25 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
 
     if (inserted) {
       if (need_convert) {
+        // 修复P1-1：使用全局原子时间戳进行转换节流
+        const uint64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const uint64_t min_interval = 1000; // 1ms最小间隔
+        
+        uint64_t last_time = g_last_conversion_time.load(std::memory_order_acquire);
+        if (now - last_time < min_interval) {
+          // 转换过于频繁，跳过本次转换
+          return true;
+        }
+        
+        // 尝试更新全局转换时间戳
+        if (!g_last_conversion_time.compare_exchange_strong(last_time, now, 
+                                                           std::memory_order_acq_rel, 
+                                                           std::memory_order_acquire)) {
+          // 其他线程已触发转换，跳过
+          return true;
+        }
+        
         // 仅允许一个线程发起交换：CAS序列化
         SegmentedBlock* expected = seg;
         SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
@@ -146,13 +173,26 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
 
     // 插入失败（块满或被替换）：尝试切换分段块
     if (need_convert) {
-      SegmentedBlock* expected = seg;
-      SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
-      if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        seg->MarkConversionTriggered();
-        converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
-      } else {
-        delete new_seg;
+      // 修复P1-1：同样使用全局原子时间戳进行转换节流
+      const uint64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      const uint64_t min_interval = 1000; // 1ms最小间隔
+      
+      uint64_t last_time = g_last_conversion_time.load(std::memory_order_acquire);
+      if (now - last_time >= min_interval) {
+        // 尝试更新全局转换时间戳
+        if (g_last_conversion_time.compare_exchange_strong(last_time, now, 
+                                                         std::memory_order_acq_rel, 
+                                                         std::memory_order_acquire)) {
+          SegmentedBlock* expected = seg;
+          SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
+          if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            seg->MarkConversionTriggered();
+            converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
+          } else {
+            delete new_seg;
+          }
+        }
       }
     }
     // 继续循环，重试插入新分段块
@@ -388,14 +428,25 @@ void SBTree::UpdateSearchLayerWithDataBlocks(std::vector<std::unique_ptr<DataBlo
   if (data_blocks.empty()) {
     return;
   }
-  // 插入所有数据块：论文要求每个数据块的最小键都应被索引
-  DataBlock* head = data_blocks[0].release();
-  if (!head) return;
-  InsertDataBlockToSearchLayer(head);
-  DataBlock* curr = head->GetNextBlock().get();
-  while (curr) {
-    InsertDataBlockToSearchLayer(curr);
-    curr = curr->GetNextBlock().get();
+  
+  // 修复P0-1：数据层所有权管理 - 先转移所有权，再获取引用
+  std::vector<DataBlock*> data_block_ptrs;
+  data_block_ptrs.reserve(data_blocks.size());
+  
+  // 转移所有权到数据层容器
+  {
+    std::lock_guard<std::mutex> lock(data_layer_mutex_);
+    for (auto& block : data_blocks) {
+      if (block) {
+        data_block_ptrs.push_back(block.get());
+        data_layer_blocks_.push_back(std::move(block));
+      }
+    }
+  }
+  
+  // 搜索层仅持有引用
+  for (DataBlock* block_ptr : data_block_ptrs) {
+    InsertDataBlockToSearchLayer(block_ptr);
   }
 }
 
@@ -407,16 +458,43 @@ void SBTree::IndexDataBlockNonOwning(DataBlock* data_block) {
 bool SBTree::LookupInSegmentedBlock(uint64_t key, uint64_t* out_value) const {
   SegmentedBlock* seg = current_segmented_block_.load(std::memory_order_acquire);
   if (!seg) return false;
+  
+  // 修复P1-3：优化segmented block扫描，避免O(80)全扫描
+  // 策略1：只在分段块键范围内查找
+  const uint64_t seg_min = seg->GetMinKey();
+  const uint64_t seg_max = seg->GetMaxKey();
+  
+  if (key < seg_min || key > seg_max) {
+    return false; // key不在分段块范围内，直接跳过
+  }
+  
+  // 策略2：优先检查最近活跃的线程块（基于线程ID的启发式）
   const size_t max_threads = seg->GetMaxThreads();
-  for (size_t i = 0; i < max_threads; ++i) {
+  
+  // 首先检查当前线程的块（最可能包含新数据）
+  thread_local static size_t tls_last_checked_thread = 0;
+  size_t start_thread = tls_last_checked_thread % max_threads;
+  
+  for (size_t offset = 0; offset < max_threads; ++offset) {
+    size_t i = (start_thread + offset) % max_threads;
     PerThreadDataBlock* pt_block = seg->LoadPerThreadBlock(i);
     if (!pt_block) continue;
+    
     const auto& kv_pairs = pt_block->GetAllKv();
+    
+    // 注意：PerThreadDataBlock中的数据不是排序的，所以不能使用这个优化
+    // if (!kv_pairs.empty() && key < kv_pairs.front().key) {
+    //   continue;
+    // }
+    
     for (const auto& kv : kv_pairs) {
       if (kv.key == key) {
         *out_value = kv.value;
+        tls_last_checked_thread = i; // 记录最近找到的线程
         return true;
       }
+      // 注意：PerThreadDataBlock中的数据不是排序的，所以不能使用这个优化
+      // if (kv.key > key) break; // 利用有序特性提前退出
     }
   }
   return false;

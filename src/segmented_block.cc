@@ -122,8 +122,13 @@ bool SegmentedBlock::NeedConversion(uint64_t /*current_max_key*/) const {
   return false;
 }
 
-void SegmentedBlock::BeginWrite() {
+bool SegmentedBlock::BeginWrite() {
+  // 修复P0-2：转换期间禁止新写入
+  if (conversion_triggered_.load(std::memory_order_acquire)) {
+    return false; // 转换已触发，拒绝新写入
+  }
   active_writers_.fetch_add(1, std::memory_order_acq_rel);
+  return true; // 成功获取写锁
 }
 
 void SegmentedBlock::EndWrite() {
@@ -138,6 +143,9 @@ void SegmentedBlock::WaitForQuiescent() const {
 }
 
 void SegmentedBlock::MarkConversionTriggered() {
+  // 修复P0-2：设置转换触发标记，禁止新写入
+  conversion_triggered_.store(true, std::memory_order_release);
+  
   const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
   last_conversion_ns_.store(now, std::memory_order_release);

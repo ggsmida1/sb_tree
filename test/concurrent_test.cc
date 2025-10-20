@@ -100,7 +100,7 @@ public:
                     const uint64_t* value = tree.Lookup(key);
                     
                     if (value != nullptr) {
-                        assert(*value == key * 10);
+                        assert(*value == static_cast<uint64_t>(key * 10));
                         successful_lookups.fetch_add(1);
                     } else {
                         failed_lookups.fetch_add(1);

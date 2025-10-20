@@ -15,9 +15,7 @@ DataBlock::DataBlock(BlockAllocator* allocator)
 }
 
 int DataBlock::Insert(uint64_t key, uint64_t value, std::unique_ptr<DataBlock>* split_block) {
-  // 使用写互斥锁保护并发写操作
-  std::unique_lock<std::mutex> write_lock(write_mutex_);
-  
+  // 修复P1-2：使用pure version + atomic，移除冗余的mutex
   version_.WriteLock();  // 写锁：标记写入开始（引用1-93）
   // 使用RAII确保解锁
   struct WriteUnlocker {
@@ -110,7 +108,7 @@ std::unique_ptr<DataBlock> DataBlock::Split() {
 
 void DataBlock::BulkFill(const std::vector<KeyValuePair>& kv, size_t start_idx, size_t end_idx) {
   if (start_idx >= end_idx) return;
-  std::unique_lock<std::mutex> write_lock(write_mutex_);
+  // 修复P1-2：使用pure version + atomic，移除冗余的mutex
   version_.WriteLock();
   struct WriteUnlocker {
     Version& version_;
@@ -148,14 +146,23 @@ const uint64_t* DataBlock::Lookup(uint64_t key) const {
   const size_t bucket_end = std::min(
       bucket_start + search_table_.GetBucketSize(), size_);
 
+  const uint64_t* result = nullptr;
   for (size_t i = bucket_start; i < bucket_end; ++i) {
     if (keys_[i] == key) {
-      return &values_[i];
+      result = &values_[i];
+      break;
     } else if (keys_[i] > key) {
       break;
     }
   }
-  return nullptr;
+  
+  // 修复P0-4：读后版本校验，确保数据一致性
+  if (!version_.IsConsistent(start_version)) {
+    // 读后版本不一致，返回nullptr（上层需重试）
+    return nullptr;
+  }
+  
+  return result;
 }
 
 size_t DataBlock::Scan(uint64_t start_key, size_t count, 
@@ -179,6 +186,13 @@ size_t DataBlock::Scan(uint64_t start_key, size_t count,
   // 填充结果
   for (size_t i = 0; i < take; ++i) {
     result->emplace_back(KeyValuePair{keys_[start_pos + i], values_[start_pos + i]});
+  }
+
+  // 修复P0-4：读后版本校验，确保数据一致性
+  if (!version_.IsConsistent(start_version)) {
+    // 读后版本不一致，清空结果并返回0（上层需重试）
+    result->clear();
+    return 0;
   }
 
   // 跨块扫描（引用1-128）

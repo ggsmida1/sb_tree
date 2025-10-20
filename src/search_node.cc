@@ -23,7 +23,6 @@ bool SearchNode::InsertDataBlock(uint64_t min_key, DataBlock* data_block) {
     return false;
   }
   std::unique_lock<std::shared_mutex> lock(rw_mutex_);  // 独占写锁
-  std::lock_guard<std::mutex> write_lock(write_mutex_);  // 额外的写锁保护
   
   if (IsFull()) {
     return false;  // 需分裂，上层处理
@@ -43,7 +42,6 @@ bool SearchNode::InsertChild(uint64_t max_key, std::unique_ptr<SearchNode> child
     return false;
   }
   std::unique_lock<std::shared_mutex> lock(rw_mutex_);  // 独占写锁
-  std::lock_guard<std::mutex> write_lock(write_mutex_);  // 额外的写锁保护
   
   if (IsFull()) {
     return false;  // 需分裂
@@ -63,7 +61,6 @@ bool SearchNode::Split(std::unique_ptr<SearchNode>* new_node, uint64_t* split_ke
     return false;
   }
   std::unique_lock<std::shared_mutex> lock(rw_mutex_);  // 独占写锁
-  std::lock_guard<std::mutex> write_lock(write_mutex_);  // 额外的写锁保护
   
   if (!IsFull()) {
     return false;
@@ -136,10 +133,11 @@ SearchNode* SearchNode::FindChild(uint64_t key) const {
     return nullptr;
   }
   
+  // 修复P0-3：右溢逻辑错误 - 右溢应落到最右子树
   auto it = std::upper_bound(keys_.begin(), keys_.end(), key);
   const size_t pos = std::distance(keys_.begin(), it);
   if (pos >= children_.size()) {
-    return nullptr;
+    return children_.back().get(); // 右溢：返回最右子树
   }
   return children_[pos].get();
 }

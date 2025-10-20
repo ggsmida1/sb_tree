@@ -59,11 +59,60 @@ target_link_libraries(debug_test sb_tree)
 add_executable(simple_test test/simple_test.cc)
 target_link_libraries(simple_test sb_tree)
 
-# 包含测试目录的CMakeLists.txt
-add_subdirectory(test)
+# 多线程测试
+add_executable(simple_multithread_test test/simple_multithread_test.cc)
+target_link_libraries(simple_multithread_test sb_tree pthread)
+
+add_executable(detailed_multithread_test test/detailed_multithread_test.cc)
+target_link_libraries(detailed_multithread_test sb_tree pthread)
+
+add_executable(multithreaded_insert_test test/multithreaded_insert_test.cc)
+target_link_libraries(multithreaded_insert_test sb_tree pthread)
+
+# 性能对比和演示测试
+add_executable(performance_comparison_test test/performance_comparison_test.cc)
+target_link_libraries(performance_comparison_test sb_tree pthread)
+
+add_executable(conservative_performance_test test/conservative_performance_test.cc)
+target_link_libraries(conservative_performance_test sb_tree pthread)
+
+add_executable(final_performance_demo test/final_performance_demo.cc)
+target_link_libraries(final_performance_demo sb_tree pthread)
+
+# 调试和特殊测试
+add_executable(debug_insert test/debug_insert.cc)
+target_link_libraries(debug_insert sb_tree pthread)
+
+add_executable(simple_insert_test test/simple_insert_test.cc)
+target_link_libraries(simple_insert_test sb_tree pthread)
+
+add_executable(test_need_conversion test/test_need_conversion.cc)
+target_link_libraries(test_need_conversion sb_tree pthread)
+
+# 纯插入吞吐量测试
+add_executable(insert_throughput_test test/insert_throughput_test.cc)
+target_link_libraries(insert_throughput_test sb_tree pthread)
+
+# 简单吞吐量测试（1-2线程）
+add_executable(simple_throughput_test test/simple_throughput_test.cc)
+target_link_libraries(simple_throughput_test sb_tree pthread)
+
+add_executable(throughput_modes_test test/throughput_modes_test.cc)
+target_link_libraries(throughput_modes_test sb_tree pthread)
+
+# 安全吞吐量测试（降低插入数量避免崩溃）
+add_executable(safe_throughput_test test/safe_throughput_test.cc)
+target_link_libraries(safe_throughput_test sb_tree pthread)
+
+# 包含测试目录的CMakeLists.txt（如果需要额外测试）
+# add_subdirectory(test)
 
 # 安装目标
 install(TARGETS sb_tree basic_test performance_test concurrent_test benchmark
+        simple_multithread_test detailed_multithread_test multithreaded_insert_test
+        performance_comparison_test conservative_performance_test final_performance_demo
+        debug_insert simple_insert_test test_need_conversion
+        insert_throughput_test simple_throughput_test throughput_modes_test safe_throughput_test
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)

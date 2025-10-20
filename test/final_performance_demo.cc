@@ -20,7 +20,7 @@ int main() {
     std::cout << "测试配置:" << std::endl;
     std::cout << "  每线程插入数: " << inserts_per_thread << std::endl;
     std::cout << "  测试线程数: ";
-    for (int i = 0; i < thread_counts.size(); ++i) {
+    for (size_t i = 0; i < thread_counts.size(); ++i) {
         std::cout << thread_counts[i];
         if (i < thread_counts.size() - 1) std::cout << ", ";
     }

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <functional>
 #include <thread>
+#include <iostream>
 
 // -----------------------------------------------------------------------------
 // SegmentedBlockConverter 实现（论文4.2节，引用1-107、1-108）
@@ -58,7 +59,7 @@ void SegmentedBlockConverter::ConversionThreadMain() {
       
       // 等待任务或批量超时
       auto timeout = std::chrono::nanoseconds(kBatchTimeoutNs);
-      bool has_tasks = task_cv_.wait_for(lock, timeout, [this]() {
+      task_cv_.wait_for(lock, timeout, [this]() {
         return stop_threads_ || !task_queue_.empty() || !index_queue_.empty();
       });
       
@@ -92,6 +93,8 @@ void SegmentedBlockConverter::ConversionThreadMain() {
     // 批量处理转换任务
     for (auto& task : batch_tasks) {
       if (!task) continue;
+
+      // 处理转换任务
 
       // 等待旧分段块上无活跃写者，确保安全抓取
       task->WaitForQuiescent();

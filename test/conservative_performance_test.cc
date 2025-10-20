@@ -65,7 +65,7 @@ int main() {
             baseline_throughput = throughput;
         }
         
-        double speedup = baseline_throughput > 0 ? throughput / baseline_throughput : 1.0;
+        // double speedup = baseline_throughput > 0 ? throughput / baseline_throughput : 1.0;  // 暂时注释掉未使用的变量
         
         std::cout << std::setw(8) << num_threads
                   << std::setw(12) << std::fixed << std::setprecision(1) << duration_ms
