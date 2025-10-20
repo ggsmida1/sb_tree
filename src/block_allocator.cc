@@ -9,9 +9,22 @@ thread_local std::unique_ptr<BlockAllocator::PerThreadFreeList> BlockAllocator::
 // BlockAllocator 实现（论文3.5节，引用1-89、1-90）
 // -----------------------------------------------------------------------------
 BlockAllocator::BlockAllocator(size_t block_size)
-    : block_size_(block_size) {
-  // 初始化全局备用列表（按CPU核心数）
+    : block_size_(block_size),
+      pre_allocated_memory_(nullptr),
+      memory_pool_size_(0),
+      memory_pool_offset_(0) {
+  // 预分配大块内存池（论文要求：避免malloc系统调用）
   const size_t num_cores = std::thread::hardware_concurrency();
+  const size_t blocks_per_core = 1000;  // 每核心预分配1000个块
+  memory_pool_size_ = num_cores * blocks_per_core * block_size_;
+  pre_allocated_memory_ = std::aligned_alloc(64, memory_pool_size_);  // 64字节对齐
+  
+  if (!pre_allocated_memory_) {
+    // 如果预分配失败，回退到malloc
+    memory_pool_size_ = 0;
+  }
+  
+  // 初始化全局备用列表（按CPU核心数）
   global_free_lists_.reserve(num_cores);
   for (size_t i = 0; i < num_cores; ++i) {
     global_free_lists_.emplace_back(std::make_unique<PerThreadFreeList>());
@@ -19,6 +32,10 @@ BlockAllocator::BlockAllocator(size_t block_size)
 }
 
 BlockAllocator::~BlockAllocator() {
+  // 释放预分配内存池
+  if (pre_allocated_memory_) {
+    std::free(pre_allocated_memory_);
+  }
   // 全局备用列表自动释放（PerThreadFreeList析构函数释放块）
 }
 
@@ -49,7 +66,18 @@ void* BlockAllocator::Allocate() {
     return block;
   }
 
-  // 全局列表也为空，动态分配（引用1-89）
+  // 从预分配内存池分配（论文要求：避免malloc系统调用）
+  if (pre_allocated_memory_ && memory_pool_size_ > 0) {
+    std::lock_guard<std::mutex> pool_lock(memory_pool_mutex_);
+    size_t current_offset = memory_pool_offset_.load(std::memory_order_acquire);
+    if (current_offset + block_size_ <= memory_pool_size_) {
+      void* block = static_cast<char*>(pre_allocated_memory_) + current_offset;
+      memory_pool_offset_.store(current_offset + block_size_, std::memory_order_release);
+      return block;
+    }
+  }
+
+  // 预分配内存池耗尽，回退到malloc（应该很少发生）
   return malloc(block_size_);
 }
 

@@ -79,22 +79,44 @@ void SegmentedBlock::UpdateKeyRange(uint64_t key) {
 
 bool SegmentedBlock::NeedConversion(uint64_t /*current_max_key*/) const {
   // 论文：当任何一个每线程数据块满时就应触发转换
+  // 但添加频率控制，避免过于频繁的转换
+  static thread_local uint64_t last_conversion_time = 0;
+  static constexpr uint64_t kMinConversionIntervalNs = 1000000;  // 1ms最小间隔
+  
+  uint64_t current_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+  
+  // 检查是否有块满了
+  bool has_full_block = false;
   for (size_t i = 0; i < max_threads_; ++i) {
     PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
     if (pt_block && pt_block->IsFull()) {
-      return true;
+      has_full_block = true;
+      break;
     }
   }
-
-  // 可选：存在明显延迟数据也触发（最小键落在当前分段块范围左侧）
-  const uint64_t seg_min = min_key_.load(std::memory_order_acquire);
-  for (size_t i = 0; i < max_threads_; ++i) {
-    PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
-    if (!pt_block) continue;
-    const uint64_t pt_min = pt_block->GetMinKey();
-    if (pt_min != kInvalidKey && seg_min != kInvalidKey && pt_min < seg_min) {
-      return true;
+  
+  if (!has_full_block) {
+    // 检查延迟数据
+    const uint64_t seg_min = min_key_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < max_threads_; ++i) {
+      PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
+      if (!pt_block) continue;
+      const uint64_t pt_min = pt_block->GetMinKey();
+      if (pt_min != kInvalidKey && seg_min != kInvalidKey && pt_min < seg_min) {
+        has_full_block = true;
+        break;
+      }
     }
+  }
+  
+  if (has_full_block) {
+    // 频率控制：如果距离上次转换时间太短，延迟转换
+    if (current_time - last_conversion_time < kMinConversionIntervalNs) {
+      return false;  // 延迟转换
+    }
+    last_conversion_time = current_time;
+    return true;
   }
 
   return false;
