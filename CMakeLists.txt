@@ -66,6 +66,14 @@ target_link_libraries(conversion_analysis sb_tree pthread)
 add_executable(step_by_step_test step_by_step_test.cc)
 target_link_libraries(step_by_step_test sb_tree pthread)
 
+# 性能对比测试
+add_executable(performance_comparison performance_comparison.cc)
+target_link_libraries(performance_comparison sb_tree pthread)
+
+# 大数据量测试
+add_executable(large_scale_test large_scale_test.cc)
+target_link_libraries(large_scale_test sb_tree pthread)
+
 # 多线程测试
 add_executable(simple_multithread_test test/simple_multithread_test.cc)
 target_link_libraries(simple_multithread_test sb_tree pthread)
