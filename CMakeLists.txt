@@ -35,29 +35,36 @@ target_include_directories(sb_tree PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(sb_tree Threads::Threads)
 
-# 基本功能测试
+# ============================================================================
+# 测试目标定义
+# ============================================================================
+
+# 基础功能测试
 add_executable(basic_test test/basic_test.cc)
 target_link_libraries(basic_test sb_tree)
 
-# 性能测试
-add_executable(performance_test test/performance_test.cc)
-target_link_libraries(performance_test sb_tree)
-
-# 并发测试
-add_executable(concurrent_test test/concurrent_test.cc)
-target_link_libraries(concurrent_test sb_tree)
-
-# 基准测试
-add_executable(benchmark test/benchmark_test.cc)
-target_link_libraries(benchmark sb_tree)
-
-# 调试测试
-add_executable(debug_test test/debug_test.cc)
-target_link_libraries(debug_test sb_tree)
-
-# 简单测试
 add_executable(simple_test test/simple_test.cc)
 target_link_libraries(simple_test sb_tree)
+
+# 基础功能完整性测试
+add_executable(basic_functionality_test basic_functionality_test.cc)
+target_link_libraries(basic_functionality_test sb_tree pthread)
+
+# 数据丢失诊断测试
+add_executable(data_loss_diagnostic data_loss_diagnostic.cc)
+target_link_libraries(data_loss_diagnostic sb_tree pthread)
+
+# 8线程完整性能测试
+add_executable(threaded_performance_test threaded_performance_test.cc)
+target_link_libraries(threaded_performance_test sb_tree pthread)
+
+# 转换过程分析测试
+add_executable(conversion_analysis conversion_analysis.cc)
+target_link_libraries(conversion_analysis sb_tree pthread)
+
+# 逐步复杂度测试
+add_executable(step_by_step_test step_by_step_test.cc)
+target_link_libraries(step_by_step_test sb_tree pthread)
 
 # 多线程测试
 add_executable(simple_multithread_test test/simple_multithread_test.cc)
@@ -69,7 +76,16 @@ target_link_libraries(detailed_multithread_test sb_tree pthread)
 add_executable(multithreaded_insert_test test/multithreaded_insert_test.cc)
 target_link_libraries(multithreaded_insert_test sb_tree pthread)
 
-# 性能对比和演示测试
+# 性能测试
+add_executable(performance_test test/performance_test.cc)
+target_link_libraries(performance_test sb_tree)
+
+add_executable(concurrent_test test/concurrent_test.cc)
+target_link_libraries(concurrent_test sb_tree)
+
+add_executable(benchmark test/benchmark_test.cc)
+target_link_libraries(benchmark sb_tree)
+
 add_executable(performance_comparison_test test/performance_comparison_test.cc)
 target_link_libraries(performance_comparison_test sb_tree pthread)
 
@@ -79,7 +95,23 @@ target_link_libraries(conservative_performance_test sb_tree pthread)
 add_executable(final_performance_demo test/final_performance_demo.cc)
 target_link_libraries(final_performance_demo sb_tree pthread)
 
+# 吞吐量测试
+add_executable(insert_throughput_test test/insert_throughput_test.cc)
+target_link_libraries(insert_throughput_test sb_tree pthread)
+
+add_executable(simple_throughput_test test/simple_throughput_test.cc)
+target_link_libraries(simple_throughput_test sb_tree pthread)
+
+add_executable(throughput_modes_test test/throughput_modes_test.cc)
+target_link_libraries(throughput_modes_test sb_tree pthread)
+
+add_executable(safe_throughput_test test/safe_throughput_test.cc)
+target_link_libraries(safe_throughput_test sb_tree pthread)
+
 # 调试和特殊测试
+add_executable(debug_test test/debug_test.cc)
+target_link_libraries(debug_test sb_tree)
+
 add_executable(debug_insert test/debug_insert.cc)
 target_link_libraries(debug_insert sb_tree pthread)
 
@@ -89,30 +121,21 @@ target_link_libraries(simple_insert_test sb_tree pthread)
 add_executable(test_need_conversion test/test_need_conversion.cc)
 target_link_libraries(test_need_conversion sb_tree pthread)
 
-# 纯插入吞吐量测试
-add_executable(insert_throughput_test test/insert_throughput_test.cc)
-target_link_libraries(insert_throughput_test sb_tree pthread)
+# 性能分析测试
+add_executable(performance_analysis test/performance_analysis.cc)
+target_link_libraries(performance_analysis sb_tree pthread)
 
-# 简单吞吐量测试（1-2线程）
-add_executable(simple_throughput_test test/simple_throughput_test.cc)
-target_link_libraries(simple_throughput_test sb_tree pthread)
-
-add_executable(throughput_modes_test test/throughput_modes_test.cc)
-target_link_libraries(throughput_modes_test sb_tree pthread)
-
-# 安全吞吐量测试（降低插入数量避免崩溃）
-add_executable(safe_throughput_test test/safe_throughput_test.cc)
-target_link_libraries(safe_throughput_test sb_tree pthread)
-
-# 包含测试目录的CMakeLists.txt（如果需要额外测试）
-# add_subdirectory(test)
-
+# ============================================================================
 # 安装目标
-install(TARGETS sb_tree basic_test performance_test concurrent_test benchmark
+# ============================================================================
+install(TARGETS sb_tree 
+        basic_test simple_test basic_functionality_test
         simple_multithread_test detailed_multithread_test multithreaded_insert_test
+        performance_test concurrent_test benchmark
         performance_comparison_test conservative_performance_test final_performance_demo
-        debug_insert simple_insert_test test_need_conversion
         insert_throughput_test simple_throughput_test throughput_modes_test safe_throughput_test
+        debug_test debug_insert simple_insert_test test_need_conversion
+        performance_analysis
         RUNTIME DESTINATION bin
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib)

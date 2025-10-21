@@ -99,11 +99,6 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
     // 修复P0-2：使用SegmentedBlock内部slot分配，避免线程ID冲突
     const size_t thread_id = seg->AllocateSlot();
     
-    // 调试信息：记录slot分配情况（减少输出频率）
-    static thread_local int debug_count = 0;
-    if (++debug_count % 1000 == 0) {
-      std::cout << "Insert: thread_id=" << thread_id << ", key=" << key << std::endl;
-    }
 
     bool inserted = false;
     bool need_convert = false;
@@ -116,6 +111,7 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
       }
       PerThreadDataBlock* pt_block = seg->AllocatePerThreadBlock(thread_id);
       if (!pt_block) {
+        std::cerr << "ERROR: Failed to allocate PerThreadBlock for thread_id=" << thread_id << std::endl;
         return false;
       }
       // 再次确认seg仍为当前分段块且slot未被替换
@@ -128,9 +124,9 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
       } else {
         // 3. 插入PerThreadBlock（引用1-103）
         if (pt_block->Insert(key, value)) {
-          // 更新分段块的键范围
+          // 论文设计：fast path无需同步，只在转换时更新范围
+          // 但为了查询正确性，仍需要更新键范围（使用更轻量的方式）
           seg->UpdateKeyRange(key);
-          // 论文：仅当当前线程块满时才需要转换
           need_convert = pt_block->IsFull();
           inserted = true;
         } else {
@@ -162,20 +158,21 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
         }
         
         // 正确的转换流程：先标记旧分段块，再切换
-        std::cout << "Insert: Triggering conversion for segmented block (key=" << key << ")" << std::endl;
         
-        // 1. 标记旧分段块为转换中，阻止新写入
-        seg->MarkConversionTriggered();
-        
-        // 2. 创建新分段块并原子切换
+        // 1. 先创建新分段块并原子切换
         SegmentedBlock* expected = seg;
         SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
         if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          // 2. 切换成功后，标记旧分段块为转换中
+          seg->MarkConversionTriggered();
           // 3. 提交旧分段块的转换任务
           converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
-          std::cout << "Insert: Conversion task submitted for old segmented block" << std::endl;
+          
+          // 更新转换计数器（用于性能分析）
+          // 使用静态计数器，避免链接问题
+          static std::atomic<int> conversion_count{0};
+          conversion_count.fetch_add(1, std::memory_order_relaxed);
         } else {
-          std::cout << "Insert: Another thread already triggered conversion" << std::endl;
           delete new_seg;
         }
       }
@@ -636,6 +633,47 @@ size_t SBTree::Scan(uint64_t start_key, size_t count,
       break;
     }
     std::this_thread::yield();  // 版本不一致，重试
+  }
+
+  // 论文设计：确保Scan包含SegmentedBlock中的数据
+  // 如果扫描结果不足，继续从SegmentedBlock中获取数据
+  if (total_scanned < count) {
+    SegmentedBlock* seg = current_segmented_block_.load(std::memory_order_acquire);
+    if (seg) {
+      std::vector<KeyValuePair> seg_data;
+      seg_data.reserve(1024);
+      
+      // 收集SegmentedBlock中的所有数据
+      const size_t max_threads = seg->GetMaxThreads();
+      for (size_t i = 0; i < max_threads; ++i) {
+        PerThreadDataBlock* pt_block = seg->LoadPerThreadBlock(i);
+        if (!pt_block) continue;
+        const auto& kv = pt_block->GetAllKv();
+        seg_data.insert(seg_data.end(), kv.begin(), kv.end());
+      }
+      
+      if (!seg_data.empty()) {
+        // 排序SegmentedBlock数据
+        std::sort(seg_data.begin(), seg_data.end(), 
+                  [](const KeyValuePair& a, const KeyValuePair& b) {
+                    return a.key < b.key;
+                  });
+        
+        // 找到起始位置
+        auto it = std::lower_bound(seg_data.begin(), seg_data.end(), 
+                                  start_key, 
+                                  [](const KeyValuePair& a, uint64_t k) {
+                                    return a.key < k;
+                                  });
+        
+        // 添加剩余需要的数据
+        size_t remaining = count - total_scanned;
+        for (; it != seg_data.end() && remaining > 0; ++it, --remaining) {
+          result->push_back(*it);
+          total_scanned++;
+        }
+      }
+    }
   }
 
   return total_scanned;

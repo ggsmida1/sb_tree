@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <iostream>
 
 // -----------------------------------------------------------------------------
 // SegmentedBlock 实现（论文3.3节，引用1-71、1-105）
@@ -30,19 +31,28 @@ SegmentedBlock::~SegmentedBlock() {
 
 PerThreadDataBlock* SegmentedBlock::AllocatePerThreadBlock(size_t thread_id) {
   if (thread_id >= max_threads_) {
+    std::cerr << "ERROR: thread_id " << thread_id << " >= max_threads " << max_threads_ << std::endl;
     return nullptr;
   }
   
+  // 首先检查是否已经存在
   PerThreadDataBlock* existing = per_thread_blocks_[thread_id].load(std::memory_order_acquire);
-  if (existing) return existing;
+  if (existing) {
+    return existing;
+  }
   
+  // 创建新的PerThreadBlock
   PerThreadDataBlock* created = new PerThreadDataBlock(allocator_);
-  if (per_thread_blocks_[thread_id].compare_exchange_strong(existing, created, std::memory_order_acq_rel, std::memory_order_acquire)) {
+  
+  // 尝试原子设置
+  PerThreadDataBlock* expected = nullptr;
+  if (per_thread_blocks_[thread_id].compare_exchange_strong(expected, created, std::memory_order_acq_rel, std::memory_order_acquire)) {
     return created;
   }
-  // 其他线程已放入
+  
+  // 其他线程已经设置了，删除我们创建的
   delete created;
-  return existing;
+  return expected;
 }
 
 PerThreadDataBlock* SegmentedBlock::LoadPerThreadBlock(size_t thread_id) const {
@@ -78,45 +88,51 @@ void SegmentedBlock::UpdateKeyRange(uint64_t key) {
 }
 
 bool SegmentedBlock::NeedConversion(uint64_t /*current_max_key*/) const {
-  // 论文：当任何一个每线程数据块满时就应触发转换
-  // 但添加频率控制，避免过于频繁的转换
-  static thread_local uint64_t last_conversion_time = 0;
-  static constexpr uint64_t kMinConversionIntervalNs = 1000000;  // 1ms最小间隔
+  // 论文设计：当任何一个每线程数据块满时就应触发转换
+  // 优化：基于实际使用的slot数量，而非固定80个
   
-  uint64_t current_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-  
-  // 检查是否有块满了
+  // 统计实际使用的slot数量
+  size_t active_slots = 0;
   bool has_full_block = false;
+  
   for (size_t i = 0; i < max_threads_; ++i) {
     PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
-    if (pt_block && pt_block->IsFull()) {
-      has_full_block = true;
-      break;
-    }
-  }
-  
-  if (!has_full_block) {
-    // 检查延迟数据
-    const uint64_t seg_min = min_key_.load(std::memory_order_acquire);
-    for (size_t i = 0; i < max_threads_; ++i) {
-      PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
-      if (!pt_block) continue;
-      const uint64_t pt_min = pt_block->GetMinKey();
-      if (pt_min != kInvalidKey && seg_min != kInvalidKey && pt_min < seg_min) {
+    if (pt_block) {
+      active_slots++;
+      if (pt_block->IsFull()) {
         has_full_block = true;
         break;
       }
     }
   }
   
+  // 如果没有任何活跃slot，不需要转换
+  if (active_slots == 0) {
+    return false;
+  }
+  
+  // 如果有块满了，立即转换
   if (has_full_block) {
-    // 频率控制：如果距离上次转换时间太短，延迟转换
-    if (current_time - last_conversion_time < kMinConversionIntervalNs) {
-      return false;  // 延迟转换
-    }
-    last_conversion_time = current_time;
     return true;
+  }
+  
+  // 优化：如果活跃slot较少但数据量较大，也触发转换
+  // 避免少数线程的数据长期不转换
+  if (active_slots <= 4 && active_slots > 0) {
+    // 计算总数据量
+    size_t total_data = 0;
+    for (size_t i = 0; i < max_threads_; ++i) {
+      PerThreadDataBlock* pt_block = per_thread_blocks_[i].load(std::memory_order_acquire);
+      if (pt_block) {
+        total_data += pt_block->GetAllKv().size();
+      }
+    }
+    
+    // 如果总数据量超过阈值，触发转换
+    constexpr size_t kConversionThreshold = 2048;  // 2K条记录
+    if (total_data >= kConversionThreshold) {
+      return true;
+    }
   }
 
   return false;
@@ -152,6 +168,21 @@ void SegmentedBlock::MarkConversionTriggered() {
 }
 
 size_t SegmentedBlock::AllocateSlot() {
-  // 修复P0-2：原子分配slot，避免线程ID冲突
-  return next_slot_.fetch_add(1, std::memory_order_acq_rel) % max_threads_;
+  // 修复：使用更安全的线程ID分配方式
+  // 使用线程局部存储确保线程ID在有效范围内
+  static std::atomic<size_t> slot_counter{0};
+  thread_local size_t tls_slot = SIZE_MAX;
+  
+  if (tls_slot == SIZE_MAX) {
+    // 首次分配：使用原子计数器分配slot
+    tls_slot = slot_counter.fetch_add(1, std::memory_order_relaxed) % max_threads_;
+  }
+  
+  // 验证slot在有效范围内
+  if (tls_slot >= max_threads_) {
+    std::cerr << "ERROR: Invalid slot " << tls_slot << " >= max_threads " << max_threads_ << std::endl;
+    tls_slot = 0; // 回退到slot 0
+  }
+  
+  return tls_slot;
 }
