@@ -127,7 +127,9 @@ void SegmentedBlockConverter::ConversionThreadMain() {
       // 4. 通知SBTree更新搜索层（引用1-119）
       // 修复P0-1：不再在转换器中建立链表，由SBTree统一管理所有权
       if (!data_blocks.empty()) {
+        std::cout << "Converter: Processing " << data_blocks.size() << " data blocks" << std::endl;
         sb_tree_->UpdateSearchLayerWithDataBlocks(std::move(data_blocks));
+        std::cout << "Converter: Updated search layer with data blocks" << std::endl;
       }
       // 延迟回收：gc_list在作用域末尾自动释放
       
@@ -139,7 +141,9 @@ void SegmentedBlockConverter::ConversionThreadMain() {
 
 void SegmentedBlockConverter::WaitForIdle() {
   // 等待所有待处理任务完成
+  std::cout << "WaitForIdle: Starting wait, pending_tasks=" << pending_tasks_.load() << std::endl;
   while (pending_tasks_.load(std::memory_order_acquire) > 0) {
     std::this_thread::yield();
   }
+  std::cout << "WaitForIdle: All tasks completed" << std::endl;
 }

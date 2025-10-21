@@ -159,8 +159,10 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
         SegmentedBlock* expected = seg;
         SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
         if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          std::cout << "Insert: Triggering conversion for segmented block" << std::endl;
           seg->MarkConversionTriggered();
           converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
+          std::cout << "Insert: Conversion task submitted" << std::endl;
         } else {
           delete new_seg;
         }

@@ -101,12 +101,18 @@ void TestConcurrentInsert() {
     // 启动多个线程进行插入
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&tree, &thread_keys, t, inserts_per_thread]() {
+            std::cout << "Thread " << t << " starting insert..." << std::endl;
             for (int i = 0; i < inserts_per_thread; ++i) {
                 uint64_t key = t * inserts_per_thread + i;
                 uint64_t value = key * 10;
-                assert(tree.Insert(key, value));
+                bool success = tree.Insert(key, value);
+                if (!success) {
+                    std::cout << "Thread " << t << " failed to insert key=" << key << std::endl;
+                }
+                assert(success);
                 thread_keys[t].push_back(key);
             }
+            std::cout << "Thread " << t << " completed " << thread_keys[t].size() << " inserts" << std::endl;
         });
     }
     
@@ -119,12 +125,31 @@ void TestConcurrentInsert() {
     tree.WaitForConverterIdle();
     
     // 验证所有插入的数据都能正确查找
+    int failed_count = 0;
+    int total_checked = 0;
     for (int t = 0; t < num_threads; ++t) {
+        std::cout << "Checking thread " << t << " with " << thread_keys[t].size() << " keys" << std::endl;
         for (uint64_t key : thread_keys[t]) {
+            total_checked++;
             const uint64_t* value = tree.Lookup(key);
-            assert(value != nullptr);
-            assert(*value == key * 10);
+            if (value == nullptr) {
+                failed_count++;
+                if (failed_count <= 10) {
+                    std::cout << "FAILED: key=" << key << " (thread " << t << ") - lookup returned nullptr" << std::endl;
+                }
+            } else if (*value != key * 10) {
+                failed_count++;
+                if (failed_count <= 10) {
+                    std::cout << "FAILED: key=" << key << " (thread " << t << ") - expected=" << (key * 10) << ", got=" << *value << std::endl;
+                }
+            }
         }
+    }
+    std::cout << "Total checked: " << total_checked << ", Failed: " << failed_count << std::endl;
+    
+    if (failed_count > 0) {
+        std::cout << "Concurrent insert test FAILED with " << failed_count << " errors!" << std::endl;
+        return;
     }
     
     std::cout << "Concurrent insert test passed!" << std::endl;
