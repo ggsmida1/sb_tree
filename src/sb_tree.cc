@@ -98,6 +98,12 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
 
     // 修复P0-2：使用SegmentedBlock内部slot分配，避免线程ID冲突
     const size_t thread_id = seg->AllocateSlot();
+    
+    // 调试信息：记录slot分配情况（减少输出频率）
+    static thread_local int debug_count = 0;
+    if (++debug_count % 1000 == 0) {
+      std::cout << "Insert: thread_id=" << thread_id << ", key=" << key << std::endl;
+    }
 
     bool inserted = false;
     bool need_convert = false;
@@ -155,15 +161,21 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
           return true;
         }
         
-        // 仅允许一个线程发起交换：CAS序列化
+        // 正确的转换流程：先标记旧分段块，再切换
+        std::cout << "Insert: Triggering conversion for segmented block (key=" << key << ")" << std::endl;
+        
+        // 1. 标记旧分段块为转换中，阻止新写入
+        seg->MarkConversionTriggered();
+        
+        // 2. 创建新分段块并原子切换
         SegmentedBlock* expected = seg;
         SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
         if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
-          std::cout << "Insert: Triggering conversion for segmented block" << std::endl;
-          seg->MarkConversionTriggered();
+          // 3. 提交旧分段块的转换任务
           converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
-          std::cout << "Insert: Conversion task submitted" << std::endl;
+          std::cout << "Insert: Conversion task submitted for old segmented block" << std::endl;
         } else {
+          std::cout << "Insert: Another thread already triggered conversion" << std::endl;
           delete new_seg;
         }
       }
@@ -186,7 +198,7 @@ bool SBTree::Insert(uint64_t key, uint64_t value) {
           SegmentedBlock* expected = seg;
           SegmentedBlock* new_seg = new SegmentedBlock(kSegmentedBlockMaxThreads, &allocator_);
           if (current_segmented_block_.compare_exchange_strong(expected, new_seg, std::memory_order_acq_rel, std::memory_order_acquire)) {
-            seg->MarkConversionTriggered();
+            // 异步转换优化：不设置conversion_triggered_，允许并发写入
             converter_.SubmitConversionTask(std::unique_ptr<SegmentedBlock>(seg));
           } else {
             delete new_seg;

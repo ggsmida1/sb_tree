@@ -123,9 +123,9 @@ bool SegmentedBlock::NeedConversion(uint64_t /*current_max_key*/) const {
 }
 
 bool SegmentedBlock::BeginWrite() {
-  // 修复P0-2：转换期间禁止新写入
+  // 版本锁机制：检查当前分段块是否已被标记转换
   if (conversion_triggered_.load(std::memory_order_acquire)) {
-    return false; // 转换已触发，拒绝新写入
+    return false; // 旧分段块已标记转换，拒绝新写入
   }
   active_writers_.fetch_add(1, std::memory_order_acq_rel);
   return true; // 成功获取写锁

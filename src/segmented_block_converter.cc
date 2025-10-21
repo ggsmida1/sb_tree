@@ -90,7 +90,8 @@ void SegmentedBlockConverter::ConversionThreadMain() {
 
       // 处理转换任务
 
-      // 等待旧分段块上无活跃写者，确保安全抓取
+      // 异步转换优化：等待旧分段块上无活跃写者，确保安全抓取
+      // 注意：由于异步转换，可能有新数据仍在写入，需要等待
       task->WaitForQuiescent();
 
       // 1. 合并所有PerThreadBlock的KV对（引用1-108）

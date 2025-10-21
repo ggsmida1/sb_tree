@@ -13,8 +13,8 @@ int main() {
     std::cout << "===============================================" << std::endl;
     std::cout << std::endl;
     
-    // 测试配置
-    const int inserts_per_thread = 1000;
+    // 测试配置 - 增加数据量以获得更准确的性能测量
+    const int inserts_per_thread = 10000;
     std::vector<int> thread_counts = {1, 2, 4, 8};
     
     std::cout << "测试配置:" << std::endl;
@@ -49,16 +49,25 @@ int main() {
         
         for (int t = 0; t < num_threads; ++t) {
             threads.emplace_back([&, t]() {
+                std::cout << "Thread " << t << " starting..." << std::endl;
+                int thread_success = 0;
+                int thread_fail = 0;
                 for (int i = 0; i < inserts_per_thread; ++i) {
                     uint64_t key = static_cast<uint64_t>(t) * inserts_per_thread + i;
                     uint64_t value = key * 10;
                     
                     if (tree.Insert(key, value)) {
                         success_count.fetch_add(1);
+                        thread_success++;
                     } else {
                         fail_count.fetch_add(1);
+                        thread_fail++;
+                        if (thread_fail <= 3) {
+                            std::cout << "Thread " << t << " failed to insert key=" << key << std::endl;
+                        }
                     }
                 }
+                std::cout << "Thread " << t << " completed: success=" << thread_success << ", fail=" << thread_fail << std::endl;
             });
         }
         
@@ -66,11 +75,15 @@ int main() {
             thread.join();
         }
         
+        std::cout << "All threads completed. Waiting for converter..." << std::endl;
+        tree.WaitForConverterIdle();
+        std::cout << "Converter completed." << std::endl;
+        
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         
         double duration_ms = static_cast<double>(duration.count());
-        if (duration_ms < 0.1) duration_ms = 0.1; // 避免除零
+        if (duration_ms < 0.001) duration_ms = 0.001; // 修复：使用更合理的最小时间（1微秒）
         
         double throughput = static_cast<double>(success_count.load()) / duration_ms * 1000;
         double success_rate = static_cast<double>(success_count.load()) / (num_threads * inserts_per_thread) * 100;
@@ -87,6 +100,10 @@ int main() {
                   << std::setw(15) << std::fixed << std::setprecision(0) << throughput
                   << std::setw(12) << std::fixed << std::setprecision(1) << success_rate << "%"
                   << std::setw(10) << std::fixed << std::setprecision(2) << speedup << "x" << std::endl;
+        
+        // 详细性能分析
+        std::cout << "  -> 实际耗时: " << duration_ms << "ms, 成功插入: " << success_count.load() 
+                  << ", 失败: " << fail_count.load() << std::endl;
     }
     
     std::cout << std::endl;
