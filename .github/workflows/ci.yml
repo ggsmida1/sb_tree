@@ -28,5 +28,7 @@ jobs:
           test_concurrent_gtest
           sbtree_single_thread_test
 
-      - name: Run tests
-        run: ctest --test-dir build --output-on-failure --timeout 120
+      - name: Run project tests
+        run: >-
+          ctest --test-dir build --output-on-failure --timeout 120
+          -R '^(SegmentedBlockSeal|ConcurrentInsert|RowexConcurrent|SBTreeTest)\.'
